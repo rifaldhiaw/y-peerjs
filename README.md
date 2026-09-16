@@ -194,6 +194,12 @@ await provider.whenReady
 // with connect/disconnect controls:
 const widget = createTopologyWidget({ provider })
 
+// The panel is draggable and collapsible (▸/▾ in its header). Edges in the
+// graph are directed: the arrow points from whoever called connect() to
+// whoever accepted it. Programmatic control is available too:
+// widget.setCollapsed(true)
+// widget.isCollapsed()
+
 // ...later:
 // widget.destroy()
 ```

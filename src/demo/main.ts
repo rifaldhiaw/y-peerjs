@@ -34,8 +34,13 @@ const provider = new PeerjsProvider(doc, {
   autoConnectTo: [] // or: ['known-peer-id'] to reconnect automatically on load
 })
 
-// Floating panel: live topology graph + connect/disconnect controls.
-const widget = createTopologyWidget({ provider, position: { x: 16, y: 16 } })
+// Floating panel: live topology graph (directed edges) + connect/disconnect
+// controls. Press the ▸/▾ button in its header to collapse/expand it.
+const widget = createTopologyWidget({
+  provider,
+  position: { x: 16, y: 16 },
+  onToggleCollapsed: (collapsed) => log('widget', collapsed ? 'collapsed' : 'expanded')
+})
 window.addEventListener('beforeunload', () => widget.destroy())
 
 provider.whenReady.then((id) => {

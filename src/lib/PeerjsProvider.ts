@@ -33,9 +33,14 @@ function fingerprint (bytes: Uint8Array, kind = 'u'): string {
   return kind + ':' + (hash >>> 0).toString(36) + ':' + bytes.length
 }
 
+/** How a connection was initiated: we called connect(), or the peer did. */
+export type ConnectionDirection = 'outgoing' | 'incoming'
+
 export interface ConnState {
   conn: DataConnection
   synced: boolean
+  /** Whether we initiated this connection (outgoing) or the peer did (incoming). */
+  direction: ConnectionDirection
 }
 
 export interface PeerjsProviderOptions {
@@ -162,7 +167,7 @@ export class PeerjsProvider extends Observable<string> {
     // Prevent unhandled-rejection noise if nobody awaits whenReady.
     this.whenReady.catch(() => {})
 
-    this.peer.on('connection', (conn) => this._acceptIncoming(conn))
+    this.peer.on('connection', (conn) => this._acceptIncoming(conn, 'incoming'))
     this.peer.on('disconnected', () => this.emit('status', [{ status: 'broker-disconnected' }]))
     this.peer.on('close', () => this.emit('status', [{ status: 'peer-closed' }]))
 
@@ -266,7 +271,7 @@ export class PeerjsProvider extends Observable<string> {
           this.connecting.delete(targetId)
           reject(err)
         })
-        this._acceptIncoming(conn)
+        this._acceptIncoming(conn, 'outgoing')
       })
     })
 
@@ -389,8 +394,10 @@ export class PeerjsProvider extends Observable<string> {
    * Wires up lifecycle + message handlers for a DataConnection, whether it
    * was initiated by us (connect()) or received from the peer (incoming
    * 'connection' event on the underlying Peer).
+   * @param direction 'outgoing' when called from connect(), 'incoming' for
+   * connections the peer initiated.
    */
-  _acceptIncoming (conn: DataConnection): void {
+  _acceptIncoming (conn: DataConnection, direction: ConnectionDirection = 'incoming'): void {
     const peerId = conn.peer
     // Avoid double-wiring the same conn object.
     const wired = (conn as unknown as { __yPeerjsWired?: boolean }).__yPeerjsWired
@@ -411,7 +418,7 @@ export class PeerjsProvider extends Observable<string> {
         }
       }
 
-      this.connections.set(peerId, { conn, synced: false })
+      this.connections.set(peerId, { conn, synced: false, direction })
       this.emit('peers', [{ added: [peerId], removed: [], webrtcPeers: this.connectedPeers, bcPeers: [] }])
       this.emit('status', [{ status: 'peer-connected', id: peerId }])
 
