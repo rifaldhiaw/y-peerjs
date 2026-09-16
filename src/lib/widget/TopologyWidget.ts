@@ -4,7 +4,7 @@ import type { PeerjsProvider } from '../PeerjsProvider.js'
 export interface PeerAvatar {
   /** Display name, from awareness state `user.name` if present. */
   name: string
-  /** Two-letter initials derived from the name (or 'PE' fallback for peer id). */
+  /** Two-letter initials derived from the name (or id fallback). */
   initials: string
   /** Node fill color, from awareness state `user.color` if present. */
   color: string
@@ -57,6 +57,12 @@ export interface TopologyWidgetOptions {
   onToggleCollapsed?: (collapsed: boolean) => void
   /** Fallback color for nodes/avatars when a peer has no `user.color`. Default '#a6e3a1'. */
   fallbackColor?: string
+  /**
+   * How many characters of a peer id to show before/after the ellipsis in
+   * compact contexts (graph labels, list rows). Default 6. The full id is
+   * always available in the detail view (with a copy button).
+   */
+  shortIdLength?: number
 }
 
 /** Small inline icon set (stroke-based, 24x24 viewBox). */
@@ -69,27 +75,30 @@ const ICONS: Record<string, string> = {
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
-  dot: '<circle cx="12" cy="12" r="4"/>'
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>'
 }
 
 function icon (name: string, size = 14): string {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px">${ICONS[name] ?? ''}</svg>`
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;flex-shrink:0">${ICONS[name] ?? ''}</svg>`
 }
 
 /**
- * A floating, draggable widget that visualizes the provider's FULL mesh —
- * both directly-connected peers and indirect peers learned through the mesh
- * protocol (including via whom they are reachable) — and lets the user
- * connect to or disconnect from any of them.
+ * A floating widget that visualizes the provider's FULL mesh — directly
+ * connected peers plus indirect peers learned through the mesh protocol —
+ * in a two-panel layout: graph on the left, list/detail on the right.
  *
  * Features:
  *  - full-mesh graph: solid directed edges for direct connections (arrow =
- *    initiator → accepter), dashed edges for indirect peers
- *  - awareness avatars: initials overlaid on each node (`user` field)
- *  - clickable nodes: opens an inspect panel with peer details and actions
- *    (connect if not directly connected, disconnect if directly connected)
- *  - draggable header with a collapse/expand toggle; collapsible to a pill
- *  - connect (via input + button) and per-peer disconnect controls
+ *    initiator → accepter), dashed edges for indirect peers ("via" label)
+ *  - compact ids: graph/list show name-first labels and truncated ids;
+ *    the full id lives in the detail view with a copy button
+ *  - clicking a node or list row opens the detail view in the right panel
+ *    (identity, route, hop count, actions); clicking yourself shows your
+ *    own identity with editable name/color (written to awareness)
+ *  - awareness avatars on nodes; per-panel scrollbars styled to match
+ *  - draggable header with collapse/expand toggle
  */
 export interface TopologyWidget {
   /** Current topology snapshot, recomputed on every provider event. */
@@ -100,12 +109,55 @@ export interface TopologyWidget {
   isCollapsed(): boolean
   /** Collapse or expand the panel programmatically. */
   setCollapsed(collapsed: boolean): void
-  /** The peer id currently open in the inspect panel, or null. */
+  /** The peer id currently shown in the detail view, or null (list view). */
   getInspected(): string | null
-  /** Open the inspect panel for a peer id (or close it with null). */
+  /** Show a peer's detail view ('self' for yourself), or null for the list. */
   inspect(peerId: string | null): void
   /** Remove the panel from the DOM and detach all listeners. */
   destroy(): void
+}
+
+/** Inject the widget's scoped stylesheet once per document. */
+function ensureStyles (doc: Document): void {
+  if (doc.getElementById('ypw-styles')) return
+  const style = document.createElement('style')
+  style.id = 'ypw-styles'
+  style.textContent = `
+    .ypw-scroll {
+      scrollbar-width: thin;
+      scrollbar-color: #585b70 transparent;
+    }
+    .ypw-scroll::-webkit-scrollbar {
+      width: 8px;
+    }
+    .ypw-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .ypw-scroll::-webkit-scrollbar-thumb {
+      background: #45475a;
+      border-radius: 8px;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+    .ypw-scroll::-webkit-scrollbar-thumb:hover {
+      background: #585b70;
+      border: 2px solid transparent;
+      background-clip: padding-box;
+    }
+    .ypw-row:hover {
+      background: #262637;
+    }
+    .ypw-row.selected {
+      background: #313244;
+    }
+    .ypw-btn:hover {
+      filter: brightness(1.2);
+    }
+    .ypw-input:focus {
+      border-color: #89b4fa !important;
+    }
+  `
+  doc.head.appendChild(style)
 }
 
 export function createTopologyWidget ({
@@ -114,18 +166,19 @@ export function createTopologyWidget ({
   position = { x: 16, y: 16 },
   startCollapsed = false,
   onToggleCollapsed,
-  fallbackColor = '#a6e3a1'
+  fallbackColor = '#a6e3a1',
+  shortIdLength = 6
 }: TopologyWidgetOptions): TopologyWidget {
   if (!container) throw new Error('TopologyWidget requires a DOM container')
+  ensureStyles(container.ownerDocument ?? document)
 
   let collapsed = startCollapsed
   let inspected: string | null = null
 
+  const shorten = (id: string): string =>
+    id.length <= shortIdLength * 2 + 1 ? id : `${id.slice(0, shortIdLength)}…${id.slice(-shortIdLength)}`
+
   // --- awareness: map Yjs clientIDs to PeerJS ids -------------------------
-  // Awareness states are keyed by Yjs clientID, which has no inherent
-  // relation to PeerJS peer ids. We publish our own peer id inside our
-  // awareness state under a dedicated field and read it back from remote
-  // states to match avatars to graph nodes.
   const AWARENESS_PEER_ID_FIELD = 'peerId'
 
   function publishOwnPeerId (): void {
@@ -164,6 +217,12 @@ export function createTopologyWidget ({
     return found
   }
 
+  /** Best short display label for a peer: name if known, else short id. */
+  function displayNameFor (peerId: string): string {
+    const av = avatarFor(peerId)
+    return av && av.name !== peerId ? av.name : shorten(peerId)
+  }
+
   // --- DOM scaffold -------------------------------------------------------
   const root = document.createElement('div')
   root.className = 'ypw-root'
@@ -172,7 +231,7 @@ export function createTopologyWidget ({
     `left:${position.x}px`,
     `top:${position.y}px`,
     'z-index:2147483647',
-    'width:260px',
+    'width:460px',
     'background:#181825f2',
     'backdrop-filter:blur(8px)',
     'color:#cdd6f4',
@@ -185,57 +244,44 @@ export function createTopologyWidget ({
   ].join(';')
   container.appendChild(root)
 
-  const BTN = 'display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#313244;border:1px solid #585b70;color:#cdd6f4;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
-  const BTN_DANGER = 'display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#45243a;border:1px solid #f38ba8;color:#f38ba8;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
+  const BTN = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#313244;border:1px solid #585b70;color:#cdd6f4;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
+  const BTN_DANGER = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#45243a;border:1px solid #f38ba8;color:#f38ba8;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
+  const BTN_OK = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#1e3328;border:1px solid #a6e3a1;color:#a6e3a1;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
 
   root.innerHTML = `
-    <div class="ypw-header" style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;cursor:grab;border-bottom:1px solid #45475a;gap:8px">
-      <span class="ypw-title" style="flex-shrink:0;font-weight:bold">${icon('globe', 13)} topology</span>
-      <span class="ypw-stats" style="opacity:.75;font-size:11px;flex:1;text-align:right"></span>
+    <div class="ypw-header" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;cursor:grab;border-bottom:1px solid #45475a;gap:8px">
+      <span class="ypw-title" style="flex-shrink:0;font-weight:bold;display:inline-flex;align-items:center;gap:5px">${icon('globe', 13)} topology</span>
+      <span class="ypw-selfchip" style="flex:1;display:inline-flex;align-items:center;gap:6px;justify-content:flex-end;min-width:0;cursor:pointer" title="inspect yourself"></span>
       <button class="ypw-collapse" title="collapse" style="flex-shrink:0;cursor:pointer;background:none;border:none;color:#cdd6f4;font:inherit;padding:0 2px;line-height:1">▾</button>
     </div>
-    <div class="ypw-body">
-      <svg class="ypw-graph" width="100%" height="170" style="display:block;cursor:default"></svg>
-      <div class="ypw-controls" style="display:flex;gap:6px;padding:8px 10px;border-top:1px solid #313244">
-        <input class="ypw-target" placeholder="peer id…" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:5px 8px;outline:none" />
-        <button class="ypw-connect" title="connect to peer" style="${BTN}">${icon('plug', 12)}</button>
+    <div class="ypw-body" style="display:flex;min-height:240px">
+      <div class="ypw-left" style="flex:1.2;min-width:0;display:flex;flex-direction:column;border-right:1px solid #313244">
+        <svg class="ypw-graph" width="100%" height="200" style="display:block;flex-shrink:0"></svg>
+        <div class="ypw-controls" style="display:flex;gap:6px;padding:8px 10px;border-top:1px solid #313244;margin-top:auto">
+          <input class="ypw-target ypw-input" placeholder="peer id…" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:5px 8px;outline:none" />
+          <button class="ypw-connect ypw-btn" title="connect to peer" style="${BTN}">${icon('plug', 12)}</button>
+        </div>
       </div>
-      <ul class="ypw-peers" style="list-style:none;margin:0;padding:2px 10px 8px;max-height:140px;overflow-y:auto"></ul>
+      <div class="ypw-right" style="flex:1;min-width:0;display:flex;flex-direction:column">
+        <div class="ypw-right-head" style="padding:6px 10px;border-bottom:1px solid #313244;display:flex;flex-direction:column;gap:2px"></div>
+        <div class="ypw-right-body ypw-scroll" style="flex:1;overflow-y:auto;padding:4px 6px"></div>
+      </div>
     </div>
   `
 
   const headerEl = root.querySelector<HTMLElement>('.ypw-header')!
-  const statsEl = root.querySelector<HTMLElement>('.ypw-stats')!
+  const selfChip = root.querySelector<HTMLElement>('.ypw-selfchip')!
   const collapseBtn = root.querySelector<HTMLButtonElement>('.ypw-collapse')!
   const bodyEl = root.querySelector<HTMLElement>('.ypw-body')!
   const graphEl = root.querySelector<SVGSVGElement>('.ypw-graph')!
   const targetInput = root.querySelector<HTMLInputElement>('.ypw-target')!
   const connectBtn = root.querySelector<HTMLButtonElement>('.ypw-connect')!
-  const peersEl = root.querySelector<HTMLUListElement>('.ypw-peers')!
-
-  // --- inspect panel (mounted to the right of the graph) ------------------
-  const panel = document.createElement('div')
-  panel.className = 'ypw-inspect'
-  panel.style.cssText = [
-    'display:none',
-    'position:absolute',
-    'left:100%',
-    'top:0',
-    'margin-left:8px',
-    'width:240px',
-    'background:#11111bf5',
-    'border:1px solid #585b70',
-    'border-radius:12px',
-    'box-shadow:0 8px 32px #000a',
-    'padding:10px 12px',
-    'text-align:left'
-  ].join(';')
-  root.appendChild(panel)
+  const rightHead = root.querySelector<HTMLElement>('.ypw-right-head')!
+  const rightBody = root.querySelector<HTMLElement>('.ypw-right-body')!
 
   // --- collapsing ---------------------------------------------------------
   function applyCollapsed (): void {
     bodyEl.style.display = collapsed ? 'none' : ''
-    panel.style.display = collapsed || !inspected ? 'none' : 'block'
     collapseBtn.textContent = collapsed ? '▸' : '▾'
     collapseBtn.title = collapsed ? 'expand' : 'collapse'
     root.style.borderRadius = collapsed ? '999px' : '12px'
@@ -280,7 +326,7 @@ export function createTopologyWidget ({
       if (av) avatars.set(peerId, av)
     })
     provider.mesh.forEach((info, peerId) => {
-      if (provider.connections.has(peerId)) return // became direct
+      if (provider.connections.has(peerId)) return
       peers.push({ peerId, kind: 'indirect', via: info.via, path: info.path })
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
@@ -295,111 +341,223 @@ export function createTopologyWidget ({
     }
   }
 
-  // --- inspect panel ------------------------------------------------------
-  function renderInspect (): void {
-    if (!inspected || collapsed) {
-      panel.style.display = 'none'
+  // --- avatar chip --------------------------------------------------------
+  function avatarChip (av: PeerAvatar | undefined, fallbackId: string, size: number): string {
+    const color = av?.color ?? fallbackColor
+    const text = av?.initials ?? fallbackId.slice(0, 2).toUpperCase()
+    const fs = Math.round(size * 0.42)
+    return `<span style="display:inline-flex;width:${size}px;height:${size}px;border-radius:50%;background:${color};color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:${fs}px;flex-shrink:0">${text}</span>`
+  }
+
+  // --- right panel: list view --------------------------------------------
+  function renderList (): void {
+    const nDirect = provider.connections.size
+    const nIndirect = provider.mesh.size
+
+    rightHead.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-weight:bold;font-size:11px">${icon('users', 12)} peers</span>
+        <span style="flex:1"></span>
+        <span style="font-size:10.5px;opacity:.75">${nDirect} direct · ${nIndirect} indirect</span>
+      </div>
+    `
+
+    if (snapshot.peers.length === 0 && snapshot.connecting.length === 0) {
+      rightBody.innerHTML = `<div style="opacity:.5;padding:14px 6px;text-align:center">no peers yet —<br/>share your id or connect to someone</div>`
       return
     }
-    const isSelf = inspected === snapshot.selfId
-    const direct = snapshot.peers.find((p) => p.peerId === inspected && p.kind === 'direct')
-    const indirect = snapshot.peers.find((p) => p.peerId === inspected && p.kind === 'indirect')
-    const avatar = inspected === snapshot.selfId ? snapshot.selfAvatar : snapshot.avatars.get(inspected)
-    const title = avatar ? `${avatar.name} (${inspected})` : inspected
 
-    const rows: string[] = []
-    const row = (iconName: string, label: string, value: string) =>
-      `<div style="display:flex;gap:6px;align-items:baseline;margin:3px 0"><span style="width:16px;flex-shrink:0;opacity:.6">${icon(iconName, 12)}</span><span style="opacity:.6;width:64px;flex-shrink:0">${label}</span><span style="word-break:break-all">${value}</span></div>`
+    const row = (p: GraphPeer) => {
+      const av = snapshot.avatars.get(p.peerId)
+      const selected = inspected === p.peerId ? ' selected' : ''
+      const statusIcon = p.kind === 'direct'
+        ? (p.synced ? `<span style="color:#a6e3a1">${icon('check', 11)}</span>` : `<span style="color:#f9e2af">${icon('clock', 11)}</span>`)
+        : `<span style="opacity:.6">${icon('route', 11)}</span>`
+      const via = p.kind === 'indirect' ? `<span style="opacity:.55;font-size:10px">via ${displayNameFor(p.via!)}</span>` : ''
+      return `
+        <div class="ypw-row${selected}" data-peer="${p.peerId}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer">
+          ${statusIcon}
+          ${avatarChip(av, p.peerId, 22)}
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av && av.name !== p.peerId ? `<strong>${av.name}</strong> <span style="opacity:.55;font-size:10.5px">${shorten(p.peerId)}</span>` : shorten(p.peerId)}</span>
+          ${via}
+          <button class="ypw-row-action" title="${p.kind === 'direct' ? 'disconnect' : 'connect'}" style="cursor:pointer;background:none;border:none;color:${p.kind === 'direct' ? '#f38ba8' : '#a6e3a1'};padding:2px;display:inline-flex">${icon(p.kind === 'direct' ? 'scissors' : 'plug', 12)}</button>
+        </div>
+      `
+    }
 
+    const connectingRows = snapshot.connecting.map((peerId) => `
+      <div class="ypw-row" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;opacity:.6">
+        <span style="color:#f9e2af">${icon('clock', 11)}</span>
+        ${avatarChip(undefined, peerId, 22)}
+        <span style="flex:1">${shorten(peerId)}</span>
+        <span style="font-size:10.5px">connecting…</span>
+      </div>
+    `).join('')
+
+    rightBody.innerHTML = snapshot.peers.map(row).join('') + connectingRows
+
+    rightBody.querySelectorAll<HTMLElement>('.ypw-row[data-peer]').forEach((el) => {
+      const peerId = el.dataset.peer!
+      const p = snapshot.peers.find((q) => q.peerId === peerId)
+      el.addEventListener('click', () => widgetApi.inspect(inspected === peerId ? null : peerId))
+      el.querySelector('.ypw-row-action')?.addEventListener('click', (e) => {
+        e.stopPropagation()
+        if (p?.kind === 'direct') provider.disconnect(peerId)
+        else provider.connect(peerId).catch(() => {}) // errors surface via 'connection-error'
+      })
+    })
+  }
+
+  // --- right panel: detail view ------------------------------------------
+  function renderDetail (): void {
+    const peerId = inspected!
+    const isSelf = peerId === 'self' || peerId === snapshot.selfId
+    const direct = snapshot.peers.find((p) => p.peerId === peerId && p.kind === 'direct')
+    const indirect = snapshot.peers.find((p) => p.peerId === peerId && p.kind === 'indirect')
+    const connecting = snapshot.connecting.includes(peerId)
+    const av = isSelf ? snapshot.selfAvatar : snapshot.avatars.get(peerId)
+
+    const name = isSelf ? (av?.name ?? 'You') : (av?.name ?? shorten(peerId))
+    const fullId = isSelf ? (snapshot.selfId ?? '') : peerId
+
+    rightHead.innerHTML = `
+      <div style="display:flex;align-items:center;gap:6px">
+        <button class="ypw-back ypw-btn" title="back to list" style="cursor:pointer;background:none;border:none;color:#89b4fa;padding:0;display:inline-flex;align-items:center;font:11px ui-monospace,monospace">← peers</button>
+        <span style="flex:1"></span>
+        <span style="font-size:10.5px;opacity:.75">${provider.connections.size} direct · ${provider.mesh.size} indirect</span>
+      </div>
+    `
+
+    const row = (iconName: string, label: string, valueHtml: string) =>
+      `<div style="display:flex;gap:8px;align-items:baseline;margin:6px 0"><span style="width:14px;flex-shrink:0;opacity:.6;display:inline-flex">${icon(iconName, 12)}</span><span style="opacity:.6;width:58px;flex-shrink:0;font-size:10.5px">${label}</span><span style="min-width:0;word-break:break-all">${valueHtml}</span></div>`
+
+    let body = `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 4px 2px">
+        ${avatarChip(av ?? undefined, fullId, 40)}
+        <div style="min-width:0">
+          <div style="font-weight:bold;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${av.color};margin-right:5px;vertical-align:1px"></span>${av.name}` : name}</div>
+          ${av ? `<div style="opacity:.55;font-size:10.5px">${shorten(fullId)}</div>` : ''}
+        </div>
+      </div>
+      <div style="border-top:1px solid #313244;margin:8px 0"></div>
+    `
+
+    // Identity rows.
+    const idRow = `<span style="display:inline-flex;align-items:center;gap:6px;min-width:0"><span style="word-break:break-all">${fullId}</span><button class="ypw-copy ypw-btn" title="copy full id" style="cursor:pointer;background:none;border:none;color:#89b4fa;padding:2px;display:inline-flex">${icon('copy', 12)}</button></span>`
     if (isSelf) {
-      rows.push(row('user', 'role', 'you (this browser)'))
-      rows.push(row('globe', 'status', snapshot.status))
-      rows.push(row('hash', 'direct', String(provider.connections.size)))
-      rows.push(row('route', 'indirect', String(provider.mesh.size)))
-    } else if (direct) {
-      rows.push(row('user', 'role', direct.direction === 'outgoing' ? 'direct · you connected' : 'direct · connected you'))
-      rows.push(row('check', 'synced', direct.synced ? 'yes' : 'syncing…'))
-      rows.push(row('globe', 'status', '1 hop away'))
-    } else if (indirect) {
-      rows.push(row('user', 'role', 'indirect · not connected to you'))
-      // Route from our next hop through intermediates to the peer.
-      const route = [indirect.via, ...indirect.path!, inspected].join(' → ')
-      rows.push(row('route', 'route', route))
-      rows.push(row('globe', 'status', `${(indirect.path?.length ?? 0) + 1} hop${(indirect.path?.length ?? 0) === 1 ? '' : 's'} away`))
-    } else if (snapshot.connecting.includes(inspected)) {
-      rows.push(row('clock', 'status', 'connecting…'))
+      body += row('user', 'role', 'you (this browser)')
+      body += row('hash', 'id', idRow)
+      body += row('globe', 'status', snapshot.status)
+      // Editable name/color -> written to awareness so all peers see it.
+      body += `
+        <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
+          <span style="width:14px;flex-shrink:0;opacity:.6;display:inline-flex">${icon('user', 12)}</span>
+          <input class="ypw-edit-name ypw-input" value="${av?.name ?? ''}" placeholder="your name" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:4px 8px;outline:none" />
+          <input class="ypw-edit-color" type="color" value="${av?.color ?? fallbackColor}" title="your color" style="width:30px;height:26px;border:1px solid #45475a;border-radius:8px;background:#313244;cursor:pointer;padding:2px" />
+        </div>
+      `
     } else {
-      rows.push(row('user', 'role', 'unknown peer'))
-      rows.push(row('globe', 'status', 'not in mesh — connect to reach it'))
+      body += row('hash', 'id', idRow)
+      if (direct) {
+        body += row('user', 'role', direct.direction === 'outgoing' ? 'direct · you connected' : 'direct · connected you')
+        body += row('check', 'synced', direct.synced ? 'yes' : 'syncing…')
+        body += row('globe', 'status', '1 hop away')
+      } else if (indirect) {
+        body += row('user', 'role', 'indirect · not directly connected')
+        const route = [indirect.via, ...indirect.path!, peerId].join(' → ')
+        body += row('route', 'route', route)
+        const hops = (indirect.path?.length ?? 0) + 1
+        body += row('globe', 'status', `${hops} hop${hops === 1 ? '' : 's'} away`)
+      } else if (connecting) {
+        body += row('clock', 'status', 'connecting…')
+      } else {
+        body += row('user', 'role', 'unknown peer')
+        body += row('globe', 'status', 'not in mesh — connect to reach it')
+      }
     }
 
     // Actions.
     let actions = ''
-    if (isSelf) {
-      actions = ''
-    } else if (direct) {
-      actions = `<button class="ypw-act-dc" style="${BTN_DANGER}">${icon('scissors', 12)} disconnect</button>`
-    } else if (!snapshot.connecting.includes(inspected)) {
-      actions = `<button class="ypw-act-connect" style="${BTN}">${icon('plug', 12)} connect</button>`
+    if (!isSelf) {
+      if (direct) {
+        actions = `<button class="ypw-act-dc" style="${BTN_DANGER}">${icon('scissors', 12)} disconnect</button>`
+      } else if (!connecting) {
+        actions = `<button class="ypw-act-connect" style="${BTN_OK}">${icon('plug', 12)} connect</button>`
+      }
     }
+    if (actions) body += `<div style="margin-top:10px;display:flex;gap:6px">${actions}</div>`
 
-    panel.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px">
-        <strong style="word-break:break-all">${title}</strong>
-        <button class="ypw-act-close" title="close" style="cursor:pointer;background:none;border:none;color:#cdd6f4;font:inherit">✕</button>
-      </div>
-      ${avatar ? `<div style="margin-bottom:6px"><span style="display:inline-flex;width:28px;height:28px;border-radius:50%;background:${avatar.color};color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:11px">${avatar.initials}</span></div>` : ''}
-      ${rows.join('')}
-      ${actions ? `<div style="margin-top:8px;display:flex;gap:6px">${actions}</div>` : ''}
-    `
+    rightBody.innerHTML = body
+    rightBody.classList.add('ypw-scroll')
 
-    panel.querySelector('.ypw-act-close')!.addEventListener('click', () => widgetApi.inspect(null))
-    panel.querySelector('.ypw-act-dc')?.addEventListener('click', () => {
-      provider.disconnect(inspected!)
+    rightHead.querySelector('.ypw-back')!.addEventListener('click', () => widgetApi.inspect(null))
+    rightBody.querySelector('.ypw-copy')?.addEventListener('click', () => {
+      const doc = container!.ownerDocument ?? document
+      void doc.defaultView?.navigator.clipboard?.writeText(fullId).catch(() => {})
+    })
+    rightBody.querySelector('.ypw-act-dc')?.addEventListener('click', () => {
+      provider.disconnect(peerId)
       widgetApi.inspect(null)
     })
-    panel.querySelector('.ypw-act-connect')?.addEventListener('click', () => {
-      provider.connect(inspected!).catch(() => {}) // errors surface via 'connection-error'
+    rightBody.querySelector('.ypw-act-connect')?.addEventListener('click', () => {
+      provider.connect(peerId).catch(() => {}) // errors surface via 'connection-error'
     })
 
-    panel.style.display = 'block'
+    // Self-edit: persist name/color into awareness.
+    const nameInput = rightBody.querySelector<HTMLInputElement>('.ypw-edit-name')
+    const colorInput = rightBody.querySelector<HTMLInputElement>('.ypw-edit-color')
+    const commitSelf = () => {
+      const user = {
+        name: nameInput?.value.trim() || 'anonymous',
+        color: colorInput?.value ?? fallbackColor
+      }
+      provider.awareness.setLocalStateField('user', user)
+    }
+    nameInput?.addEventListener('change', commitSelf)
+    nameInput?.addEventListener('keydown', (e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() })
+    colorInput?.addEventListener('input', commitSelf)
+  }
+
+  function renderRight (): void {
+    if (inspected) renderDetail()
+    else renderList()
   }
 
   // --- rendering ----------------------------------------------------------
   function render (): void {
     snapshot = extractSnapshot()
 
-    statsEl.textContent = `${provider.connections.size} direct · ${provider.mesh.size} indirect`
-    const ns = 'http://www.w3.org/2000/svg'
+    // Header self chip.
+    const selfAv = snapshot.selfAvatar
+    selfChip.innerHTML = selfAv
+      ? `${avatarChip(selfAv, snapshot.selfId ?? '', 18)} <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${selfAv.name}</span><span style="opacity:.5;font-size:10px">${shorten(snapshot.selfId ?? '')}</span>`
+      : `<span style="opacity:.6;font-size:10.5px">${snapshot.selfId ? shorten(snapshot.selfId) : 'connecting…'}</span>`
+    selfChip.onclick = () => widgetApi.inspect(inspected === 'self' ? null : 'self')
 
-    const W = graphEl.clientWidth || 240
-    const H = 170
+    // --- left: graph ---
+    const ns = 'http://www.w3.org/2000/svg'
+    const W = graphEl.clientWidth || 250
+    const H = 200
     const cx = W / 2
     const cy = H / 2
 
-    // Ring layout: direct peers on the inner ring, indirect on the outer.
-    const innerR = Math.min(W, H) * 0.26
-    const outerR = Math.min(W, H) * 0.42
+    const innerR = Math.min(W, H) * 0.27
+    const outerR = Math.min(W, H) * 0.43
     const positions = new Map<string, { x: number, y: number }>()
 
-    let d = 0
-    snapshot.peers.forEach((p) => {
-      if (p.kind !== 'direct') return
-      const angle = (2 * Math.PI * d) / Math.max(snapshot.peers.filter((q) => q.kind === 'direct').length, 1) - Math.PI / 2
+    const directs = snapshot.peers.filter((p) => p.kind === 'direct')
+    const indirects = snapshot.peers.filter((p) => p.kind === 'indirect')
+    directs.forEach((p, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(directs.length, 1) - Math.PI / 2
       positions.set(p.peerId, { x: cx + innerR * Math.cos(angle), y: cy + innerR * Math.sin(angle) })
-      d++
     })
-    let i = 0
-    snapshot.peers.forEach((p) => {
-      if (p.kind !== 'indirect') return
-      const count = snapshot.peers.filter((q) => q.kind === 'indirect').length
-      const angle = (2 * Math.PI * i) / Math.max(count, 1) - Math.PI / 2 + Math.PI / Math.max(count, 1)
+    indirects.forEach((p, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(indirects.length, 1) - Math.PI / 2 + Math.PI / Math.max(indirects.length, 1)
       positions.set(p.peerId, { x: cx + outerR * Math.cos(angle), y: cy + outerR * Math.sin(angle) })
-      i++
     })
     snapshot.connecting.forEach((peerId, idx) => {
       const angle = Math.PI / 2 + (idx - (snapshot.connecting.length - 1) / 2) * 0.5
-      positions.set(peerId, { x: cx + (innerR + 12) * Math.cos(angle), y: cy + (innerR + 12) * Math.sin(angle) })
+      positions.set(peerId, { x: cx + (innerR + 14) * Math.cos(angle), y: cy + (innerR + 14) * Math.sin(angle) })
     })
 
     const svg = document.createElementNS(ns, 'svg')
@@ -422,7 +580,6 @@ export function createTopologyWidget ({
       const [x1, y1, x2, y2] = p.kind === 'direct'
         ? (p.direction === 'outgoing' ? [cx, cy, pos.x, pos.y] : [pos.x, pos.y, cx, cy])
         : (() => {
-            // Indirect: dashed edge from its next hop (via) to the peer.
             const viaPos = positions.get(p.via!) ?? { x: cx, y: cy }
             return [viaPos.x, viaPos.y, pos.x, pos.y]
           })()
@@ -430,8 +587,10 @@ export function createTopologyWidget ({
       edge.setAttribute('y1', String(y1))
       edge.setAttribute('x2', String(x2))
       edge.setAttribute('y2', String(y2))
+      const highlight = inspected === p.peerId || inspected === 'self' || (p.kind === 'indirect' && p.via === inspected)
       edge.setAttribute('stroke', p.kind === 'direct' ? (p.synced ? '#a6e3a1' : '#f9e2af') : '#6c7086')
-      edge.setAttribute('stroke-width', '1.5')
+      edge.setAttribute('stroke-width', highlight ? '2.5' : '1.5')
+      edge.setAttribute('opacity', inspected && !highlight ? '0.35' : '1')
       if (p.kind === 'indirect') {
         edge.setAttribute('stroke-dasharray', '4 3')
       } else {
@@ -451,9 +610,14 @@ export function createTopologyWidget ({
       circle.setAttribute('r', String(opts.r))
       circle.setAttribute('fill', opts.color)
       if (opts.dashed) {
+        circle.setAttribute('fill', '#181825')
         circle.setAttribute('stroke', '#9399b2')
         circle.setAttribute('stroke-dasharray', '3 2')
-        circle.setAttribute('fill', '#181825')
+        circle.setAttribute('stroke-width', '1.5')
+      }
+      if (inspected === peerId) {
+        circle.setAttribute('stroke', '#89b4fa')
+        circle.setAttribute('stroke-width', '2.5')
       }
       g.appendChild(circle)
 
@@ -476,14 +640,14 @@ export function createTopologyWidget ({
       label.setAttribute('y', String(pos.y - opts.r - 6))
       label.setAttribute('text-anchor', 'middle')
       label.setAttribute('fill', inspected === peerId ? '#89b4fa' : '#cdd6f4')
-      label.setAttribute('font-size', '9.5')
+      label.setAttribute('font-size', '10')
       label.textContent = opts.label
       g.appendChild(label)
 
       if (opts.sub) {
         const sub = document.createElementNS(ns, 'text')
         sub.setAttribute('x', String(pos.x))
-        sub.setAttribute('y', String(pos.y + opts.r + 12))
+        sub.setAttribute('y', String(pos.y + opts.r + 13))
         sub.setAttribute('text-anchor', 'middle')
         sub.setAttribute('fill', '#6c7086')
         sub.setAttribute('font-size', '8.5')
@@ -496,85 +660,42 @@ export function createTopologyWidget ({
         widgetApi.inspect(inspected === peerId ? null : peerId)
       })
       svg.appendChild(g)
-      return g
     }
 
-    // Indirect peers (outer ring, hollow dashed nodes).
-    snapshot.peers.forEach((p) => {
-      if (p.kind !== 'indirect') return
+    indirects.forEach((p) => {
       const pos = positions.get(p.peerId)!
       nodeFor(p.peerId, pos, {
         color: fallbackColor,
         r: 9,
-        label: snapshot.avatars.get(p.peerId)?.name ?? p.peerId,
-        sub: `via ${p.via}`,
+        label: displayNameFor(p.peerId),
+        sub: `via ${displayNameFor(p.via!)}`,
         dashed: true
       })
     })
-
-    // Connecting peers.
     snapshot.connecting.forEach((peerId) => {
       const pos = positions.get(peerId)!
-      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, label: peerId, sub: 'connecting…', cursor: 'wait' })
+      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, label: shorten(peerId), sub: 'connecting…', cursor: 'wait' })
     })
-
-    // Direct peers (inner ring, avatar nodes).
-    snapshot.peers.forEach((p) => {
-      if (p.kind !== 'direct') return
+    directs.forEach((p) => {
       const pos = positions.get(p.peerId)!
       nodeFor(p.peerId, pos, {
         color: p.synced ? (snapshot.avatars.get(p.peerId)?.color ?? '#a6e3a1') : '#f9e2af',
-        r: 11,
-        label: snapshot.avatars.get(p.peerId)?.name ?? p.peerId,
+        r: 12,
+        label: displayNameFor(p.peerId),
         sub: p.synced ? undefined : 'syncing…'
       })
     })
-
-    // Self node.
-    const selfAv = snapshot.selfAvatar
     nodeFor(snapshot.selfId ?? 'self', { x: cx, y: cy }, {
       color: selfAv?.color ?? '#89b4fa',
-      r: 13,
-      label: selfAv ? selfAv.name : (snapshot.selfId ?? 'connecting…')
+      r: 14,
+      label: selfAv ? selfAv.name : 'me'
     })
 
-    // Click empty graph space to deselect.
     svg.addEventListener('click', () => widgetApi.inspect(null))
-
     graphEl.replaceChildren(svg)
 
-    // Peer list.
-    peersEl.replaceChildren(
-      ...snapshot.peers.map((p) => {
-        const li = document.createElement('li')
-        li.style.cssText = `display:flex;justify-content:space-between;align-items:center;padding:3px 4px;border-radius:6px;cursor:pointer;${inspected === p.peerId ? 'background:#313244;' : ''}`
-        const name = document.createElement('span')
-        const av = snapshot.avatars.get(p.peerId)
-        const badge = p.kind === 'direct' ? '' : ' <span style="opacity:.6">(via ' + p.via + ')</span>'
-        name.innerHTML = `${p.kind === 'direct' ? (p.direction === 'outgoing' ? '→' : '←') : '⇢'} ${av ? av.name + ' ' : ''}<span style="opacity:.7">${p.peerId}</span>${p.kind === 'direct' && !p.synced ? ' <span style="color:#f9e2af">(syncing…)</span>' : ''}${badge}`
-        li.appendChild(name)
-        const btn = document.createElement('button')
-        btn.innerHTML = p.kind === 'direct' ? icon('scissors', 11) : icon('plug', 11)
-        btn.title = p.kind === 'direct' ? `disconnect ${p.peerId}` : `connect ${p.peerId}`
-        btn.style.cssText = 'cursor:pointer;background:none;border:none;color:' + (p.kind === 'direct' ? '#f38ba8' : '#a6e3a1') + ';padding:2px'
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation()
-          if (p.kind === 'direct') provider.disconnect(p.peerId)
-          else provider.connect(p.peerId).catch(() => {})
-        })
-        li.appendChild(btn)
-        li.addEventListener('click', () => widgetApi.inspect(inspected === p.peerId ? null : p.peerId))
-        return li
-      }),
-      ...snapshot.connecting.map((peerId) => {
-        const li = document.createElement('li')
-        li.style.cssText = 'opacity:.6;padding:3px 4px'
-        li.innerHTML = `${icon('clock', 11)} ${peerId} (connecting…)`
-        return li
-      })
-    )
-
-    renderInspect()
+    // --- right: list or detail ---
+    renderRight()
   }
 
   // --- controls -----------------------------------------------------------

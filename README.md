@@ -194,13 +194,14 @@ await provider.whenReady
 // with connect/disconnect controls:
 const widget = createTopologyWidget({ provider })
 
-// The panel is draggable and collapsible (▸/▾ in its header). The graph
-// shows the FULL mesh: solid directed edges for direct connections (arrow =
-// initiator → accepter) and dashed edges to indirect peers, labeled with
-// the peer that relays to them. Click any node to open an inspect panel
-// with details (role, route, hop count, awareness info) and connect/
-// disconnect actions. Nodes show initials avatars from the standard `user`
-// awareness field. Programmatic control:
+// The widget is a two-panel layout: graph on the left (solid directed edges
+// for direct connections, dashed edges to indirect peers labeled "via"),
+// list/detail on the right with `N direct · M indirect` stats. Peer ids are
+// shown truncated (`abcdef…uvwxyz`) — click a node or list row to open the
+// detail view with the full id (copy button), name, color, route, hop count
+// and connect/disconnect actions. Clicking yourself shows your identity
+// with an editable name/color that syncs to all peers via awareness.
+// Programmatic control:
 // widget.setCollapsed(true)
 // widget.isCollapsed()
 // widget.inspect('some-peer-id')
