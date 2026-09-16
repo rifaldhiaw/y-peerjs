@@ -62,6 +62,16 @@ provider.on('status', (event: [StatusEvent]) => log('status:', event[0]))
 provider.on('peers', (event: [PeersEvent]) => log('peers:', event[0]))
 provider.on('synced', ([{ peerId }]: [{ peerId: string }]) => log('synced with', peerId))
 provider.on('connection-error', ([err, peerId]: [Error, string]) => log('connection-error with', peerId, err.message))
+provider.on('mesh', ([{ added, removed }]: [{ added: string[], removed: string[] }]) => {
+  if (added.length > 0) log('mesh: now reachable via relay →', added.join(', '))
+  if (removed.length > 0) log('mesh: lost relay path →', removed.join(', '))
+})
+
+// Tip for trying the full-mesh view: open a third tab, connect it to only
+// ONE of the first two tabs, and watch the widget show the other tab as an
+// indirect (dashed) node "via" your direct peer. Click any node to inspect
+// it — the panel shows role, route, and hop count, with connect/disconnect
+// actions.
 
 document.getElementById('connectBtn')!.addEventListener('click', () => {
   const target = document.getElementById('targetId') as HTMLInputElement

@@ -29,8 +29,11 @@ class DataConnection extends EventEmitter {
 
   send (data) {
     if (!this.open || !this._other) return
+    // Capture the paired connection now: it may be closed (and unlink us)
+    // before the delayed delivery fires.
+    const other = this._other
     // Simulate async network delivery.
-    setTimeout(() => this._other.emit('data', data), 0)
+    setTimeout(() => other.emit('data', data), 0)
   }
 
   close () {

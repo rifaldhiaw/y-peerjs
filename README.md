@@ -194,14 +194,17 @@ await provider.whenReady
 // with connect/disconnect controls:
 const widget = createTopologyWidget({ provider })
 
-// The panel is draggable and collapsible (▸/▾ in its header). Edges in the
-// graph are directed: the arrow points from whoever called connect() to
-// whoever accepted it. Nodes show initials avatars derived from the
-// standard `user` awareness field — e.g.:
-// provider.awareness.setLocalStateField('user', { name: 'Alice', color: '#f38ba8' })
-// Programmatic control is available too:
+// The panel is draggable and collapsible (▸/▾ in its header). The graph
+// shows the FULL mesh: solid directed edges for direct connections (arrow =
+// initiator → accepter) and dashed edges to indirect peers, labeled with
+// the peer that relays to them. Click any node to open an inspect panel
+// with details (role, route, hop count, awareness info) and connect/
+// disconnect actions. Nodes show initials avatars from the standard `user`
+// awareness field. Programmatic control:
 // widget.setCollapsed(true)
 // widget.isCollapsed()
+// widget.inspect('some-peer-id')
+// widget.getInspected()
 
 // ...later:
 // widget.destroy()

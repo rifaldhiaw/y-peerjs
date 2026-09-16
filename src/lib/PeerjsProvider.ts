@@ -12,10 +12,14 @@ const messageSync = 0
 const messageAwareness = 1
 const messageQueryAwareness = 2
 const messageCustom = 3
+const messageMesh = 4
 
-// Bound on how many recently-seen update fingerprints we remember, to stop
-// gossip relay (see _relayUpdate) from growing unbounded in long sessions.
+// Bound on how many recently-seen fingerprints we remember to stop gossip
+// relay (updates + mesh announcements) from growing unbounded.
 const MAX_SEEN_UPDATES = 2000
+// How often each peer re-announces its routing table (ms). Changes also
+// trigger immediate announcements, so this is just a convergence safety net.
+const MESH_ANNOUNCE_INTERVAL = 10000
 
 /**
  * Cheap 32-bit FNV-1a hash of a byte array, used only to fingerprint Yjs
@@ -72,6 +76,31 @@ export interface StatusEvent {
   id?: string
 }
 
+/** One destination entry in a peer's advertised routing table. */
+export interface MeshTableEntry {
+  /** The destination peer id this path leads to (may be the announcer itself). */
+  dest: string
+  /** Full route from the ANNOUNCER to `dest`: next-hop first, dest last. */
+  path: string[]
+}
+
+/**
+ * What we know about a peer in the mesh that we are NOT directly connected
+ * to: how we'd reach it. `path` lists the intermediates between us and the
+ * peer (exclusive on both ends); `via` is simply its first element — the
+ * directly-connected peer that is our next hop.
+ */
+export interface MeshPeerInfo {
+  /** The remote peer id. */
+  peerId: string
+  /** Our next hop: the directly-connected peer to route through. */
+  via: string
+  /** Intermediates between us and the peer, exclusive on both ends. */
+  path: string[]
+  /** When we last (re)computed this entry (ms epoch). */
+  lastSeen: number
+}
+
 /**
  * PeerjsProvider — a Yjs connection provider built on top of PeerJS.
  *
@@ -99,7 +128,7 @@ export interface StatusEvent {
  *  - 'connection-error'  [error, peerId]                        error on a specific DataConnection
  *  - 'message-error'     [error, peerId]                        malformed/unhandled message from a peer
  *  - 'message'           [{ peerId, data }]                     raw custom messages sent via provider.send()
- *
+ *  - 'mesh'              [{ added, removed, mesh }]             remote-mesh view changed (see the mesh property)
  * @extends {Observable<string>}
  */
 export class PeerjsProvider extends Observable<string> {
@@ -111,6 +140,136 @@ export class PeerjsProvider extends Observable<string> {
   connections: Map<string, ConnState>
   /** Resolves with our own registered PeerJS id once the broker confirms it. */
   whenReady: Promise<string>
+
+  /**
+   * Indirect peers we know about from the mesh protocol, keyed by peer id.
+   * Each peer advertises its full routing table (destination -> full path)
+   * to its neighbors and recomputes its own table from what it hears, so
+   * every member learns the full reachable topology — including which of
+   * its direct connections leads to any given indirect peer, and the exact
+   * intermediate hops. Directly-connected peers never appear here.
+   */
+  mesh: Map<string, MeshPeerInfo>
+  /**
+   * Most recent routing table heard FROM each directly-connected peer:
+   * peerId -> (dest -> path from that peer to dest, next-hop first).
+   */
+  neighborTables: Map<string, Map<string, string[]>>
+
+  /**
+   * Compute our full routing view: every reachable peer (including
+   * ourselves) mapped to the complete path from us to it, next-hop first.
+   * Direct connections contribute 1-hop paths; each neighbor's advertised
+   * table contributes longer paths prefixed with that neighbor. Loop check:
+   * paths that would traverse us are dropped.
+   */
+  _computeTable (): Map<string, string[]> {
+    const next = new Map<string, string[]>()
+    const self = this.id
+    if (self === undefined) return next
+    // We can always reach ourselves, and our direct connections are the
+    // best (1-hop) paths to their endpoints.
+    next.set(self, [self])
+    this.connections.forEach((_, peerId) => next.set(peerId, [peerId]))
+    this.neighborTables.forEach((table, neighbor) => {
+      if (!this.connections.has(neighbor)) return // stale table
+      table.forEach((remotePath, dest) => {
+        if (next.has(dest)) return
+        const viaPath = [neighbor, ...remotePath]
+        if (viaPath.includes(self)) return // would loop through us
+        // Sanity: a well-formed path ends at its destination.
+        if (viaPath[viaPath.length - 1] !== dest) return
+        next.set(dest, viaPath)
+      })
+    })
+    return next
+  }
+
+  /**
+   * Rebuild our routing view from our direct connections plus the tables
+   * they've advertised, then emit 'mesh' if anything changed. Returns the
+   * new table (dest -> full path from us, next-hop first, dest last).
+   */
+  _recomputeMesh (): Map<string, string[]> {
+    const self = this.id
+    const next = this._computeTable()
+
+    // Diff against the public mesh map (which only holds indirect peers).
+    const added: string[] = []
+    const removed: string[] = []
+    const now = Date.now()
+    next.forEach((path, dest) => {
+      if (dest === self || this.connections.has(dest)) return // not indirect
+      const prev = this.mesh.get(dest)
+      const info: MeshPeerInfo = {
+        peerId: dest,
+        via: path[0],
+        path: path.slice(1, -1),
+        lastSeen: now
+      }
+      this.mesh.set(dest, info)
+      if (!prev || prev.via !== info.via || prev.path.join(',') !== info.path.join(',')) added.push(dest)
+    })
+    this.mesh.forEach((_, dest) => {
+      if (!next.has(dest)) {
+        this.mesh.delete(dest)
+        removed.push(dest)
+      }
+    })
+    if (added.length > 0 || removed.length > 0) {
+      this.emit('mesh', [{ added, removed, mesh: new Map(this.mesh) }])
+    }
+    return next
+  }
+
+  /** Advertise our full routing table to every directly-connected peer. */
+  _announceMesh (): void {
+    if (this._destroyed || this.connections.size === 0) return
+    const table = this._recomputeMesh()
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, messageMesh)
+    encoding.writeVarUint(encoder, table.size)
+    table.forEach((path, dest) => {
+      encoding.writeVarString(encoder, dest)
+      encoding.writeVarUint(encoder, path.length)
+      path.forEach((hop) => encoding.writeVarString(encoder, hop))
+    })
+    this._broadcast(encoding.toUint8Array(encoder))
+  }
+
+  /**
+   * Apply a routing table received from `fromPeerId` (one of our direct
+   * connections), then recompute and re-announce if our own view changed.
+   * Full-table replacement is what makes retraction work: a destination
+   * missing from the new table is one the neighbor can no longer reach.
+   */
+  _handleMeshTable (fromPeerId: string, entries: MeshTableEntry[]): void {
+    if (!this.connections.has(fromPeerId)) return
+    const table = new Map<string, string[]>()
+    entries.forEach(({ dest, path }) => {
+      if (path.length > 0 && path[path.length - 1] === dest) table.set(dest, path)
+    })
+    const before = this._tableKey()
+    this.neighborTables.set(fromPeerId, table)
+    if (this._tableKey() !== before) {
+      // Our view changed — propagate the news.
+      this._announceMesh()
+    }
+  }
+
+  /** Stable fingerprint of our current routing view, for change detection. */
+  _tableKey (): string {
+    return Array.from(this._computeTable().entries())
+      .map(([dest, path]) => dest + ':' + path.join('>'))
+      .sort()
+      .join('|')
+  }
+
+  /** Forget everything learned from a now-closed connection, recompute. */
+  _pruneMeshVia (closedPeerId: string): void {
+    this.neighborTables.delete(closedPeerId)
+    this._announceMesh() // recomputes internally and re-announces
+  }
 
   /** ids of currently fully-open peer connections */
   get connectedPeers (): string[] {
@@ -145,12 +304,22 @@ export class PeerjsProvider extends Observable<string> {
 
     this.connections = new Map()
     this.connecting = new Set<string>()
+    this.mesh = new Map()
+    this.neighborTables = new Map()
     /** fingerprint -> true, insertion-ordered for LRU eviction */
     this._seenUpdateHashes = new Map<string, true>()
+
+    // Periodically re-announce our routing table so peers that joined late
+    // or missed an announcement (or a retraction) converge. With full-table
+    // replacement, staleness fixes itself; no TTL eviction needed.
+    this._meshAnnounceInterval = setInterval(() => {
+      this._announceMesh()
+    }, MESH_ANNOUNCE_INTERVAL)
 
     this._destroyed = false
     this._resyncInterval = null
     this._pendingConnects = new Map()
+    this._meshAnnounceInterval = null
 
     this.peer = new Peer(peerId as string, peerOptions as never)
 
@@ -226,6 +395,7 @@ export class PeerjsProvider extends Observable<string> {
   _destroyed: boolean
   _resyncInterval: ReturnType<typeof setInterval> | null
   _pendingConnects: Map<string, Promise<DataConnection>>
+  _meshAnnounceInterval: ReturnType<typeof setInterval> | null
   _docUpdateHandler: (update: Uint8Array, origin: unknown) => void
   _awarenessUpdateHandler: (changes: { added: number[], updated: number[], removed: number[] }, origin: unknown) => void
   _beforeUnloadHandler: () => void
@@ -291,6 +461,7 @@ export class PeerjsProvider extends Observable<string> {
       this.connections.delete(targetId)
       this.emit('peers', [{ added: [], removed: [targetId], webrtcPeers: this.connectedPeers, bcPeers: [] }])
       this.emit('status', [{ status: 'peer-disconnected', id: targetId }])
+      this._pruneMeshVia(targetId)
     }
     this.connecting.delete(targetId)
   }
@@ -422,6 +593,9 @@ export class PeerjsProvider extends Observable<string> {
       this.emit('peers', [{ added: [peerId], removed: [], webrtcPeers: this.connectedPeers, bcPeers: [] }])
       this.emit('status', [{ status: 'peer-connected', id: peerId }])
 
+      // Our neighborhood changed: tell everyone, and ask the new peer to
+      // tell us about theirs (an announce right back primes the exchange).
+      this._announceMesh()
       this._sendSyncStep1(conn)
 
       if (this.awareness.getStates().size > 0) {
@@ -450,6 +624,7 @@ export class PeerjsProvider extends Observable<string> {
         this.connections.delete(peerId)
         this.emit('peers', [{ added: [], removed: [peerId], webrtcPeers: this.connectedPeers, bcPeers: [] }])
         this.emit('status', [{ status: 'peer-disconnected', id: peerId }])
+        this._pruneMeshVia(peerId)
       }
     })
 
@@ -528,6 +703,21 @@ export class PeerjsProvider extends Observable<string> {
           this.emit('message', [{ peerId, data: payload }])
           break
         }
+        case messageMesh: {
+          const count = decoding.readVarUint(decoder)
+          const entries: MeshTableEntry[] = []
+          for (let i = 0; i < count; i++) {
+            const dest = decoding.readVarString(decoder)
+            const pathLen = decoding.readVarUint(decoder)
+            const path: string[] = []
+            for (let j = 0; j < pathLen; j++) {
+              path.push(decoding.readVarString(decoder))
+            }
+            entries.push({ dest, path })
+          }
+          this._handleMeshTable(peerId, entries)
+          break
+        }
         default:
           this.emit('message-error', [new Error(`unknown message type ${messageType}`), peerId])
       }
@@ -549,6 +739,7 @@ export class PeerjsProvider extends Observable<string> {
     this._destroyed = true
 
     if (this._resyncInterval) clearInterval(this._resyncInterval)
+    if (this._meshAnnounceInterval) clearInterval(this._meshAnnounceInterval)
 
     this.doc.off('update', this._docUpdateHandler)
     this.awareness.off('update', this._awarenessUpdateHandler)

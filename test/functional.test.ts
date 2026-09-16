@@ -231,4 +231,49 @@ describe('PeerjsProvider', () => {
     providerA.destroy()
     expect(providerA.connectedPeers.length).toBe(0)
   })
+
+  it('mesh protocol: indirect peers learned via announcements with correct via/path', async () => {
+    // Chain: A -- B -- C. A and C are not directly connected, but each
+    // should learn about the other through B's announcements.
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const docC = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'chain-a' })
+    const providerB = new PeerjsProvider(docB, { peerId: 'chain-b' })
+    const providerC = new PeerjsProvider(docC, { peerId: 'chain-c' })
+    await Promise.all([providerA.whenReady, providerB.whenReady, providerC.whenReady])
+
+    await Promise.all([providerA.connect('chain-b'), providerC.connect('chain-b')])
+
+    // Wait for mesh announcements to propagate (interval is 10s but each
+    // peer announces immediately when its neighborhood changes).
+    await wait(200)
+
+    // A sees C as indirect, via B. `path` holds intermediates between the
+    // next hop and the destination — none in a 2-hop chain.
+    const aViewOfC = providerA.mesh.get('chain-c')
+    expect(aViewOfC).toBeDefined()
+    expect(aViewOfC!.via).toBe('chain-b')
+    expect(aViewOfC!.path).toEqual([])
+    // C sees A as indirect, via B.
+    const cViewOfA = providerC.mesh.get('chain-a')
+    expect(cViewOfA).toBeDefined()
+    expect(cViewOfA!.via).toBe('chain-b')
+    // B has no indirect peers — it's directly connected to both.
+    expect(providerB.mesh.size).toBe(0)
+    // neighborTables: B heard full tables from both A and C.
+    expect(providerB.neighborTables.get('chain-a')?.has('chain-a')).toBe(true)
+    expect(providerB.neighborTables.get('chain-c')?.has('chain-c')).toBe(true)
+
+    // Dropping B-C means C vanishes from A's mesh (it was only reachable
+    // through B) and B's table from C is discarded.
+    providerC.disconnect('chain-b')
+    await wait(50)
+    expect(providerA.mesh.has('chain-c')).toBe(false)
+    expect(providerB.neighborTables.has('chain-c')).toBe(false)
+
+    providerA.destroy()
+    providerB.destroy()
+    providerC.destroy()
+  })
 })
