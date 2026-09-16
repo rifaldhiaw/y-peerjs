@@ -1,5 +1,10 @@
-import Peer from 'peerjs'
-import type { DataConnection } from 'peerjs'
+// peerjs ships both a bundler-ESM build (named `Peer` export) and a CJS
+// main entry (class reachable only via the interop default object), and no
+// `exports` map — so no single static import form works in every runtime.
+// Import the namespace and resolve the constructor at runtime; the class
+// *type* is imported type-only, which is erased at compile time and safe.
+import * as peerjsModule from 'peerjs'
+import type { Peer as PeerClass, DataConnection } from 'peerjs'
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
@@ -170,10 +175,21 @@ export interface PeerjsProviderEvents {
  * peers and their routes), attach a TopologyTracker (see ./widget/), which
  * runs an opt-in discovery protocol over the generic send()/message channel.
  */
+/**
+ * Resolve the peerjs `Peer` constructor across module interop shapes:
+ *  - bundler ESM: named export on the namespace
+ *  - Node CJS interop: `Peer` on the default (module.exports) object
+ *  - some shims/older builds: the default IS the class
+ */
+const PeerCtor: typeof PeerClass =
+  (peerjsModule as { Peer?: typeof PeerClass }).Peer ??
+  (peerjsModule as { default?: { Peer?: typeof PeerClass } }).default?.Peer ??
+  (peerjsModule as unknown as typeof PeerClass)
+
 export class PeerjsProvider extends ObservableV2<PeerjsProviderEvents> {
   doc: Y.Doc
   awareness: awarenessProtocol.Awareness
-  peer: Peer
+  peer: PeerClass
   maxConns: number
   connectionTimeout: number
   heartbeatInterval: number
@@ -255,7 +271,7 @@ export class PeerjsProvider extends ObservableV2<PeerjsProviderEvents> {
       this._heartbeatTimer = setInterval(() => this._heartbeatTick(), heartbeatInterval)
     }
 
-    this.peer = new Peer(peerId as string, peerOptions as never)
+    this.peer = new PeerCtor(peerId as string, peerOptions as never)
 
     this.whenReady = new Promise<string>((resolve, reject) => {
       this.peer.on('open', (id) => {

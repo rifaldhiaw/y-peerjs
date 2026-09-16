@@ -1,6 +1,6 @@
 {
   "name": "y-peerjs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A Yjs connection provider built on PeerJS — like y-webrtc, but with explicit connect(id)/disconnect(id) control instead of room-based signaling. Includes a floating topology widget.",
   "type": "module",
   "main": "./dist/index.js",
