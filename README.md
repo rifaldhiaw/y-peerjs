@@ -99,6 +99,8 @@ exact route to them), attach the opt-in `TopologyTracker` (see below).
 | `connectionTimeout`  | `number`   | `10000`             | Milliseconds `connect()` waits for the connection to open before rejecting. |
 | `heartbeatInterval`  | `number`   | `5000`              | How often to send liveness pings to connected peers (ms). `0` disables liveness detection. |
 | `heartbeatTimeout`   | `number`   | `15000`             | How long a connection may stay completely silent (no pongs, data, or sync traffic) before it is considered dead and closed. Catches crashes, killed tabs, and network drops that never produce a `close` event. |
+| `awarenessCleanupDelay` | `number` | `30000`            | How long after a peer's connection closes before the awareness states that peer delivered (their cursor, presence…) are removed from the shared `Awareness` instance. `0` removes them immediately. States still delivered by another connection (relay) are kept. |
+| `awarenessCleanupDelay` | `number` | `30000`            | How long after a peer's connection closes before the awareness states that peer delivered (their cursor, presence…) are removed from the shared `Awareness` instance. `0` removes them immediately. States still delivered by another connection (relay) are kept. |
 
 ### Instance methods
 
@@ -165,7 +167,7 @@ own string messages with that prefix.
 - **`provider.whenReady: Promise<string>`** — resolves with our own id.
 - **`provider.connectedPeers: string[]`** — ids of currently open peer
   connections.
-- **`provider.connections: Map<string, { conn, synced }>`** — raw access
+- **`provider.connections: Map<string, { conn, synced }> |`** — raw access
   to each `peerjs.DataConnection` plus whether initial sync completed.
 
 ### Events (`provider.on(name, cb)`)
@@ -208,10 +210,11 @@ own string messages with that prefix.
   servers only; if either side is behind a symmetric NAT you'll likely
   need to supply your own TURN server via `peerOptions.config.iceServers`.
 - **Awareness cleanup**: when a peer's connection closes, this provider
-  does *not* automatically strip their awareness state from the shared
-  `Awareness` instance beyond what `y-protocols/awareness`'s own timeout
-  handles — you can call `awarenessProtocol.removeAwarenessStates` yourself
-  from a `peers`-removed handler if you want it instant.
+  automatically removes the awareness states that peer delivered (cursor,
+  presence) after `awarenessCleanupDelay` (default 30s) — provided no other
+  still-connected peer also delivers them (relay). Set the delay to `0` for
+  instant removal, or call `awarenessProtocol.removeAwarenessStates` yourself
+  from a `peers`-removed handler if you want fully custom behavior.
 
 ## Example
 

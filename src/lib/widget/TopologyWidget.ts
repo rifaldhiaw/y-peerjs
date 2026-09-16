@@ -17,8 +17,6 @@ export interface GraphPeer {
   /** 'direct' = open DataConnection; 'indirect' = known via the topology tracker. */
   kind: 'direct' | 'indirect'
   /** Only for direct peers. */
-  direction?: 'outgoing' | 'incoming'
-  /** Only for direct peers. */
   synced?: boolean
   /** Only for indirect peers: full route from us to the peer (intermediates only, next hop first). */
   path?: string[]
@@ -578,8 +576,8 @@ export function createTopologyWidget ({
     pruneRecent()
     const peers: GraphPeer[] = []
     const avatars = new Map<string, PeerAvatar>()
-    provider.connections.forEach(({ synced, direction }, peerId) => {
-      peers.push({ peerId, kind: 'direct', direction, synced })
+    provider.connections.forEach(({ synced }, peerId) => {
+      peers.push({ peerId, kind: 'direct', synced })
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
     })
@@ -760,7 +758,7 @@ export function createTopologyWidget ({
     } else {
       body += row('hash', 'id', idRow)
       if (direct) {
-        body += row('user', 'role', direct.direction === 'outgoing' ? 'direct · you connected' : 'direct · connected you')
+        body += row('user', 'role', 'direct connection')
         body += row('check', 'synced', direct.synced ? 'yes' : 'syncing…')
         body += row('globe', 'status', '1 hop away')
       } else if (indirect) {
@@ -988,7 +986,7 @@ export function createTopologyWidget ({
       if (!pos) return
       const edge = document.createElementNS(ns, 'line')
       const [x1, y1, x2, y2] = p.kind === 'direct'
-        ? (p.direction === 'outgoing' ? [cx, cy, pos.x, pos.y] : [pos.x, pos.y, cx, cy])
+        ? [cx, cy, pos.x, pos.y]
         : (() => {
             // Draw the dashed edge from the hop right before the destination
             // (the last intermediate on the route), so a chain A—B—C—D

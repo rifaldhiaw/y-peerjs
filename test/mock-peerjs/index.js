@@ -71,7 +71,12 @@ export class Peer extends EventEmitter {
     setTimeout(() => {
       const target = registry.get(targetId)
       if (!target || target.destroyed) {
-        localConn.emit('error', new Error(`peer ${targetId} not found`))
+        // Mirror real PeerJS: "peer id not registered" is a Peer-level error
+        // of type 'peer-unavailable' (the returned DataConnection is left
+        // hanging, it never emits its own 'error').
+        const err = new Error(`Could not connect to peer ${targetId}`)
+        err.type = 'peer-unavailable'
+        this.emit('error', err)
         return
       }
       const remoteConn = new DataConnection(this.id, opts.metadata)
@@ -105,6 +110,10 @@ export class Peer extends EventEmitter {
   destroy () {
     this.destroyed = true
     registry.delete(this.id)
+    // Like real PeerJS, destroy() closes every open DataConnection so the
+    // remote side sees a clean close instead of a silent vanish.
+    this._conns.forEach((conn) => conn.close())
+    this._conns.clear()
     this.emit('close')
   }
 }

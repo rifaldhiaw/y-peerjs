@@ -413,4 +413,131 @@ describe('PeerjsProvider', () => {
     providerD.destroy()
     providerA.destroy()
   })
+
+  it('disconnect() during a pending connect() cancels the attempt (pre-whenReady race)', async () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'race-a' })
+    const providerB = new PeerjsProvider(docB, { peerId: 'race-b' })
+
+    // Call connect() while A's broker registration is still pending — this
+    // is the window where disconnect() used to be silently ignored and the
+    // connection opened anyway.
+    const connectPromise = providerA.connect('race-b')
+    providerA.disconnect('race-b')
+
+    await Promise.all([providerA.whenReady, providerB.whenReady])
+    await expect(connectPromise).rejects.toThrow(/canceled/)
+
+    // The canceled attempt must not adopt the connection when it opens
+    // behind our back, and must not emit a spurious 'connection-failed'.
+    let failed = false
+    providerA.on('connection-failed', () => { failed = true })
+    await wait(100)
+    expect(providerA.connectedPeers).toEqual([])
+    expect(failed).toBe(false)
+
+    providerA.destroy()
+    providerB.destroy()
+  })
+
+  it('simultaneous mutual connect() converges on one transport', async () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'glare-a' })
+    const providerB = new PeerjsProvider(docB, { peerId: 'glare-b' })
+    await Promise.all([providerA.whenReady, providerB.whenReady])
+
+    docA.getText('shared').insert(0, 'glare-test ')
+    docB.getText('shared').insert(0, 'glare-test ')
+
+    // Both sides dial each other at the same time — classic dial glare.
+    await Promise.all([providerA.connect('glare-b'), providerB.connect('glare-a')])
+    await wait(100)
+
+    // Exactly one transport must survive on each side, and it must sync.
+    expect(providerA.connectedPeers.length).toBe(1)
+    expect(providerB.connectedPeers.length).toBe(1)
+    docA.getText('shared').insert(0, 'X')
+    docB.getText('shared').insert(0, 'Y')
+    await wait(100)
+    expect(docA.getText('shared').toString()).toBe(docB.getText('shared').toString())
+    expect(docA.getText('shared').toString()).toContain('X')
+    expect(docA.getText('shared').toString()).toContain('Y')
+
+    providerA.destroy()
+    providerB.destroy()
+  })
+
+  it('departed peer awareness state is cleaned up', async () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'aw-a', awarenessCleanupDelay: 50 })
+    const providerB = new PeerjsProvider(docB, { peerId: 'aw-b' })
+    await Promise.all([providerA.whenReady, providerB.whenReady])
+
+    await providerA.connect('aw-b')
+    await Promise.all([
+      waitForEvent(providerA, 'synced', ({ peerId }) => peerId === 'aw-b'),
+      waitForEvent(providerB, 'synced', ({ peerId }) => peerId === 'aw-a')
+    ])
+
+    providerB.awareness.setLocalState({ user: { name: 'Bob' } })
+    await wait(50)
+    const bobClientID = docB.clientID
+    expect(providerA.awareness.getStates().has(bobClientID)).toBe(true)
+
+    // Clean close: B disappears; A must drop B's awareness state shortly
+    // after (no lingering cursor). Register the waiter before destroy() —
+    // the close can propagate synchronously.
+    const peerGone = waitForEvent(providerA, 'peers', ({ removed }) => removed.includes('aw-b'))
+    providerB.destroy()
+    await peerGone
+    await wait(150) // > awarenessCleanupDelay
+    expect(providerA.awareness.getStates().has(bobClientID)).toBe(false)
+
+    providerA.destroy()
+  })
+
+  it('incoming connections are rejected when maxConns is reached', async () => {
+    const docHub = new Y.Doc()
+    const hub = new PeerjsProvider(docHub, { peerId: 'cap-hub', maxConns: 1 })
+    const spoke1 = new PeerjsProvider(new Y.Doc(), { peerId: 'cap-s1' })
+    const spoke2 = new PeerjsProvider(new Y.Doc(), { peerId: 'cap-s2' })
+    await Promise.all([hub.whenReady, spoke1.whenReady, spoke2.whenReady])
+
+    await spoke1.connect('cap-hub')
+    await waitForEvent(hub, 'synced', ({ peerId }) => peerId === 'cap-s1')
+
+    // spoke2 dials in while the hub is at capacity — must not be adopted.
+    // The dial itself may resolve transiently (the hub closes the dup right
+    // after open), so assert on the final state on both sides instead.
+    const spoke2LostPeer = waitForEvent(spoke2, 'peers', ({ removed }) => removed.includes('cap-hub'))
+    spoke2.connect('cap-hub').catch(() => {}) // rejection is fine, not under test
+    await spoke2LostPeer
+    expect(hub.connectedPeers).toEqual(['cap-s1'])
+    expect(spoke2.connectedPeers).toEqual([])
+
+    hub.destroy()
+    spoke1.destroy()
+    spoke2.destroy()
+  })
+
+  it('whenReady is not poisoned by transient peer errors', async () => {
+    const docA = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'poison-a' })
+    await providerA.whenReady
+
+    // A transient error (peer-unavailable) after registration must NOT
+    // reject whenReady (already resolved) nor break subsequent connects.
+    const failure = waitForEvent(providerA, 'connection-failed', ({}) => true)
+    await expect(providerA.connect('no-such-peer-id')).rejects.toThrow()
+    await failure
+    await expect(providerA.whenReady).resolves.toBe('poison-a')
+
+    // A failed connect does not wedge the connecting state either.
+    await expect(providerA.connect('no-such-peer-id')).rejects.toThrow()
+
+    providerA.destroy()
+  })
 })
