@@ -3,7 +3,7 @@ import type { DataConnection } from 'peerjs'
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import { Observable } from 'lib0/observable'
+import { ObservableV2 } from 'lib0/observable'
 import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
 
@@ -117,6 +117,23 @@ export interface StatusEvent {
 }
 
 /**
+ * Typed event map for {@link PeerjsProvider}, consumed by lib0's
+ * ObservableV2. Gives compile-time checking of event names and listener
+ * signatures on `provider.on(...)` / `provider.off(...)`.
+ */
+export interface PeerjsProviderEvents {
+  status: (event: StatusEvent) => void
+  peers: (event: PeersEvent) => void
+  synced: (event: { peerId: string }) => void
+  'peer-error': (err: Error) => void
+  'connection-error': (err: Error, peerId: string) => void
+  'connection-failed': (err: Error, peerId: string) => void
+  'message-error': (err: unknown, peerId: string) => void
+  message: (event: { peerId: string, data: Uint8Array }) => void
+  'internal-message': (event: { peerId: string, data: Uint8Array }) => void
+}
+
+/**
  * PeerjsProvider — a Yjs connection provider built on top of PeerJS.
  *
  * Unlike y-webrtc, there is no signaling-server "room" that auto-discovers
@@ -145,7 +162,7 @@ export interface StatusEvent {
  *  - 'message-error'     [error, peerId]                        malformed/unhandled message from a peer
  *  - 'message'           [{ peerId, data }]                     raw custom messages sent via provider.send()
  *  - 'internal-message'  [{ peerId, data }]                     opaque payloads from provider add-ons (sendInternal); apps can ignore these
- * @extends {Observable<string>}
+ * @extends {ObservableV2<PeerjsProviderEvents>}
  *
  * Note: the provider deliberately knows nothing about the wider network
  * beyond its direct connections — sync works over any graph via relaying.
@@ -153,7 +170,7 @@ export interface StatusEvent {
  * peers and their routes), attach a TopologyTracker (see ./widget/), which
  * runs an opt-in discovery protocol over the generic send()/message channel.
  */
-export class PeerjsProvider extends Observable<string> {
+export class PeerjsProvider extends ObservableV2<PeerjsProviderEvents> {
   doc: Y.Doc
   awareness: awarenessProtocol.Awareness
   peer: Peer

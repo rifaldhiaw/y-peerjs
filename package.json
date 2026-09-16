@@ -1,6 +1,6 @@
 {
   "name": "y-peerjs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Yjs connection provider built on PeerJS — like y-webrtc, but with explicit connect(id)/disconnect(id) control instead of room-based signaling. Includes a floating topology widget.",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,8 +12,8 @@
       "import": "./dist/index.js"
     },
     "./widget": {
-      "types": "./dist/widget/index.d.ts",
-      "import": "./dist/widget/index.js"
+      "types": "./dist/widget.d.ts",
+      "import": "./dist/widget.js"
     }
   },
   "files": [
@@ -29,12 +29,18 @@
     "realtime"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rifaldhiaw/y-peerjs.git"
+  },
+  "sideEffects": false,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "lib0": "^0.2.85"

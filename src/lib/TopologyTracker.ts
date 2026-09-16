@@ -1,4 +1,4 @@
-import { Observable } from 'lib0/observable'
+import { ObservableV2 } from 'lib0/observable'
 import type { PeerjsProvider } from './PeerjsProvider.js'
 
 /**
@@ -83,7 +83,11 @@ interface InternalMessageEventLike {
  *  - 'changed'  [RemotePeerInfo[]]  the set of known indirect peers (or any
  *    of their routes) changed
  */
-export class TopologyTracker extends Observable<string> {
+export interface TopologyTrackerEvents {
+  changed: (remotePeers: RemotePeerInfo[]) => void
+}
+
+export class TopologyTracker extends ObservableV2<TopologyTrackerEvents> {
   provider: PeerjsProvider
   /**
    * Most recent routing table heard FROM each directly-connected peer:

@@ -62,10 +62,10 @@ provider.whenReady.then((id) => {
   log('registered as', id)
 })
 
-provider.on('status', (event: [StatusEvent]) => log('status:', event[0]))
-provider.on('peers', (event: [PeersEvent]) => log('peers:', event[0]))
-provider.on('synced', ([{ peerId }]: [{ peerId: string }]) => log('synced with', peerId))
-provider.on('connection-error', ([err, peerId]: [Error, string]) => log('connection-error with', peerId, err.message))
+provider.on('status', (event: StatusEvent) => log('status:', event))
+provider.on('peers', (event: PeersEvent) => log('peers:', event))
+provider.on('synced', ({ peerId }) => log('synced with', peerId))
+provider.on('connection-error', (err, peerId) => log('connection-error with', peerId, err.message))
 tracker.on('changed', (remotePeers: RemotePeerInfo[]) => {
   log('topology:', remotePeers.length, 'indirect peer(s) reachable via relay')
 })

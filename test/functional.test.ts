@@ -4,9 +4,11 @@ import { PeerjsProvider, TopologyTracker } from '../src/lib/index.js'
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+type ProviderEventName = Parameters<PeerjsProvider['on']>[0]
+
 const waitForEvent = (
   provider: PeerjsProvider,
-  name: string,
+  name: ProviderEventName,
   predicate: (arg: any) => boolean = () => true,
   timeout = 3000
 ) =>
@@ -15,11 +17,11 @@ const waitForEvent = (
     const handler = (args: any) => {
       if (predicate(args)) {
         clearTimeout(timer)
-        provider.off(name, handler)
+        provider.off(name, handler as never)
         resolve(args)
       }
     }
-    provider.on(name, handler)
+    provider.on(name, handler as never)
   })
 
 describe('PeerjsProvider', () => {
