@@ -2,6 +2,7 @@ import './style.css'
 import * as Y from 'yjs'
 import { PeerjsProvider, type PeersEvent, type StatusEvent } from '../lib/index.js'
 import { createTopologyWidget } from '../lib/widget/index.js'
+import { TopologyTracker, type RemotePeerInfo } from '../lib/widget/index.js'
 
 const log = (...args: unknown[]) => {
   const el = document.getElementById('log')!
@@ -46,8 +47,13 @@ provider.awareness.setLocalStateField('user', me)
 
 // Floating panel: live topology graph (directed edges) + connect/disconnect
 // controls. Press the ▸/▾ button in its header to collapse/expand it.
+// The tracker discovers indirect peers (and their routes) via a small
+// path-vector protocol over the provider's message channel — every tab
+// needs one for the full topology to show up.
+const tracker = new TopologyTracker(provider)
 const widget = createTopologyWidget({
   provider,
+  tracker,
   position: { x: 16, y: 16 },
   onToggleCollapsed: (collapsed) => log('widget', collapsed ? 'collapsed' : 'expanded')
 })
@@ -62,9 +68,8 @@ provider.on('status', (event: [StatusEvent]) => log('status:', event[0]))
 provider.on('peers', (event: [PeersEvent]) => log('peers:', event[0]))
 provider.on('synced', ([{ peerId }]: [{ peerId: string }]) => log('synced with', peerId))
 provider.on('connection-error', ([err, peerId]: [Error, string]) => log('connection-error with', peerId, err.message))
-provider.on('mesh', ([{ added, removed }]: [{ added: string[], removed: string[] }]) => {
-  if (added.length > 0) log('mesh: now reachable via relay →', added.join(', '))
-  if (removed.length > 0) log('mesh: lost relay path →', removed.join(', '))
+tracker.on('changed', (remotePeers: RemotePeerInfo[]) => {
+  log('topology:', remotePeers.length, 'indirect peer(s) reachable via relay')
 })
 
 // Tip for trying the full-mesh view: open a third tab, connect it to only

@@ -79,6 +79,11 @@ directly connected to each other: if the hub goes down, `spoke1` and
 `spoke2` stop syncing with each other until one of them connects directly
 or to a new common hub.
 
+The provider itself deliberately knows nothing about that wider network —
+it only sees its direct connections and relays blindly. If you want to
+*discover and visualize* the reachable topology (indirect peers and the
+exact route to them), attach the opt-in `TopologyTracker` (see below).
+
 ## API
 
 ### `new PeerjsProvider(doc, options?)`
@@ -121,6 +126,35 @@ or to a new common hub.
 
 - **`provider.destroy(): void`** — closes all connections, destroys the
   underlying `Peer`, and unsubscribes from the Yjs doc/awareness.
+
+### `new TopologyTracker(provider, options?)` — opt-in topology discovery
+
+An `Observable`-based helper (from `y-peerjs/widget`) that runs a small
+path-vector discovery protocol over the provider's generic
+`send()`/`'message'` channel, so every participant learns the full
+reachable topology — which direct connection leads to any indirect peer,
+and the exact intermediate hops. The provider core stays clean; attach a
+tracker only if you need remote-peer visibility (the topology widget
+does, and creates one automatically).
+
+```js
+import { TopologyTracker } from 'y-peerjs/widget'
+
+const tracker = new TopologyTracker(provider)
+tracker.on('changed', (remotePeers) => {
+  // remotePeers: [{ peerId, path: [...intermediates, next-hop-first] }]
+  console.log('indirect peers:', remotePeers)
+})
+tracker.getPath('some-remote-peer-id') // e.g. ['hub', 'bridge'] or undefined
+
+// ...later:
+tracker.destroy()
+```
+
+Both ends need a tracker for discovery to work. Tracker messages share
+the custom-message channel with your own `provider.send()` payloads; they
+are tagged with a `y-peerjs-topo1:` wire prefix, so avoid starting your
+own string messages with that prefix.
 
 ### Properties
 
@@ -184,19 +218,25 @@ wire it up directly:
 ```js
 import * as Y from 'yjs'
 import { PeerjsProvider } from 'y-peerjs'
-import { createTopologyWidget } from 'y-peerjs/widget'
+import { createTopologyWidget, TopologyTracker } from 'y-peerjs/widget'
 
 const doc = new Y.Doc()
 const provider = new PeerjsProvider(doc, { peerId: 'my-peer-id' })
 await provider.whenReady
 
+// Optional: pass your own tracker to share discovery state with your app.
+// Omit it and the widget creates (and destroys) one for you.
+const tracker = new TopologyTracker(provider)
+
 // Floating panel showing the live connection graph,
 // with connect/disconnect controls:
-const widget = createTopologyWidget({ provider })
+const widget = createTopologyWidget({ provider, tracker })
 
-// The widget is a two-panel layout: graph on the left (solid directed edges
-// for direct connections, dashed edges to indirect peers labeled "via"),
-// list/detail on the right with `N direct · M indirect` stats. Peer ids are
+// The widget collapses to a sticky launcher button pinned to a window edge
+// (drag it along the edge; click to expand). Expanded, it is a two-panel
+// layout: graph on the left (solid edges for direct connections, dashed
+// route edges for indirect peers, draggable nodes), list/detail on the
+// right with `N direct · M indirect` stats. Peer ids are
 // shown truncated (`abcdef…uvwxyz`) — click a node or list row to open the
 // detail view with the full id (copy button), name, color, route, hop count
 // and connect/disconnect actions. Clicking yourself shows your identity
@@ -228,10 +268,11 @@ directions, live update propagation, awareness propagation, that
 edits, that a third peer can join and catch up through one `connect()`
 call, that `send()`/`'message'` works, that a star topology relays both
 Yjs updates and awareness through the hub to spokes with no direct
-connection to each other, and that a cyclic (triangle) topology converges
-without an infinite relay loop. Real PeerJS (and real WebRTC) only make
-sense in a browser, so this is what stands in for an integration test
-here — if you want to be extra sure, wire the provider up in a small page
+connection to each other, that a cyclic (triangle) topology converges
+without an infinite relay loop, and that the `TopologyTracker` learns
+correct multi-hop routes (and retracts them when links drop). Real PeerJS
+(and real WebRTC) only make sense in a browser, so this is what stands in
+for an integration test here — if you want to be extra sure, wire the provider up in a small page
 and open it in two browser tabs, which uses the real thing.
 
 ## License

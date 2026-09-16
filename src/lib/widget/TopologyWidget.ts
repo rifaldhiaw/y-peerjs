@@ -1,4 +1,5 @@
 import type { PeerjsProvider } from '../PeerjsProvider.js'
+import { TopologyTracker, type RemotePeerInfo } from './TopologyTracker.js'
 
 /** How a peer is displayed on a node: initials avatar + optional full name. */
 export interface PeerAvatar {
@@ -13,21 +14,19 @@ export interface PeerAvatar {
 /** A peer shown in the graph: directly connected, or reachable via the mesh. */
 export interface GraphPeer {
   peerId: string
-  /** 'direct' = open DataConnection; 'indirect' = known via mesh protocol. */
+  /** 'direct' = open DataConnection; 'indirect' = known via the topology tracker. */
   kind: 'direct' | 'indirect'
   /** Only for direct peers. */
   direction?: 'outgoing' | 'incoming'
   /** Only for direct peers. */
   synced?: boolean
-  /** Only for indirect peers: our next hop (one of our direct peers). */
-  via?: string
-  /** Only for indirect peers: intermediates between our next hop and the peer. */
+  /** Only for indirect peers: full route from us to the peer (intermediates only, next hop first). */
   path?: string[]
 }
 
 /**
  * Snapshot of the full connection topology: direct links plus the complete
- * reachable mesh learned via the provider's mesh protocol.
+ * reachable topology learned via the TopologyTracker's discovery protocol.
  */
 export interface TopologySnapshot {
   /** Our own registered PeerJS id, or null before the broker assigns one. */
@@ -47,11 +46,18 @@ export interface TopologySnapshot {
 export interface TopologyWidgetOptions {
   /** The provider whose topology is visualized. */
   provider: PeerjsProvider
+  /**
+   * Provide your own TopologyTracker to share it across widgets/consumers.
+   * If omitted, the widget creates and owns one (and destroys it when the
+   * widget is destroyed). The remote end needs a tracker too for discovery
+   * to work.
+   */
+  tracker?: TopologyTracker
   /** Element to attach the floating panel to. Defaults to document.body. */
   container?: HTMLElement
   /** Initial panel position in px from the top-left corner. */
   position?: { x: number, y: number }
-  /** Whether the panel starts collapsed to just its header bar. Default false. */
+  /** Whether the panel starts collapsed to just the sticky launcher button. Default true. */
   startCollapsed?: boolean
   /** Called with the new collapsed state whenever the panel is collapsed/expanded. */
   onToggleCollapsed?: (collapsed: boolean) => void
@@ -77,7 +83,8 @@ const ICONS: Record<string, string> = {
   check: '<path d="M20 6 9 17l-5-5"/>',
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
-  x: '<path d="M18 6 6 18M6 6l12 12"/>'
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  reset: '<path d="M3 12a9 9 0 1 0 2.64-6.36L3 8"/><path d="M3 3v5h5"/>'
 }
 
 function icon (name: string, size = 14): string {
@@ -85,20 +92,22 @@ function icon (name: string, size = 14): string {
 }
 
 /**
- * A floating widget that visualizes the provider's FULL mesh — directly
- * connected peers plus indirect peers learned through the mesh protocol —
- * in a two-panel layout: graph on the left, list/detail on the right.
+ * A topology inspector fronted by a sticky launcher button pinned to a
+ * window edge (drag it along the edge; cross the midline to flip sides).
+ * Click the button to expand the full two-panel inspector; click ✕ to
+ * collapse back to the button.
  *
  * Features:
- *  - full-mesh graph: solid directed edges for direct connections (arrow =
- *    initiator → accepter), dashed edges for indirect peers ("via" label)
+ *  - topology graph: solid edges for direct connections, dashed route
+ *    edges between indirect peers and their previous hop; edges are
+ *    undirected (P2P connections are bidirectional)
+ *  - draggable nodes (positions persist until the reset button)
  *  - compact ids: graph/list show name-first labels and truncated ids;
  *    the full id lives in the detail view with a copy button
  *  - clicking a node or list row opens the detail view in the right panel
  *    (identity, route, hop count, actions); clicking yourself shows your
  *    own identity with editable name/color (written to awareness)
  *  - awareness avatars on nodes; per-panel scrollbars styled to match
- *  - draggable header with collapse/expand toggle
  */
 export interface TopologyWidget {
   /** Current topology snapshot, recomputed on every provider event. */
@@ -162,9 +171,10 @@ function ensureStyles (doc: Document): void {
 
 export function createTopologyWidget ({
   provider,
+  tracker: providedTracker,
   container = typeof document !== 'undefined' ? document.body : undefined,
   position = { x: 16, y: 16 },
-  startCollapsed = false,
+  startCollapsed = true,
   onToggleCollapsed,
   fallbackColor = '#a6e3a1',
   shortIdLength = 6
@@ -172,7 +182,16 @@ export function createTopologyWidget ({
   if (!container) throw new Error('TopologyWidget requires a DOM container')
   ensureStyles(container.ownerDocument ?? document)
 
-  let collapsed = startCollapsed
+  const ownsTracker = !providedTracker
+  const tracker = providedTracker ?? new TopologyTracker(provider)
+
+  // --- graph layout state --------------------------------------------------
+  // Manual node positions (from dragging) persist across re-renders and peer
+  // churn; nodes without a saved position fall back to the automatic
+  // route-aware layout. Cleared by the reset-layout button.
+  const savedPositions = new Map<string, { x: number, y: number }>()
+  let justDragged = false
+
   let inspected: string | null = null
 
   const shorten = (id: string): string =>
@@ -225,14 +244,18 @@ export function createTopologyWidget ({
 
   // --- DOM scaffold -------------------------------------------------------
   const host: HTMLElement = container
+  const ownerDoc = host.ownerDocument ?? document
+  const view = ownerDoc.defaultView
+  const PANEL_W = 460
+  const PANEL_MARGIN = 12
+
+  // Panel — hidden until the launcher expands it.
   const root = document.createElement('div')
   root.className = 'ypw-root'
   root.style.cssText = [
     'position:fixed',
-    `left:${position.x}px`,
-    `top:${position.y}px`,
     'z-index:2147483647',
-    'width:460px',
+    `width:${PANEL_W}px`,
     'background:#181825f2',
     'backdrop-filter:blur(8px)',
     'color:#cdd6f4',
@@ -241,44 +264,75 @@ export function createTopologyWidget ({
     'border-radius:12px',
     'box-shadow:0 8px 32px #000a',
     'user-select:none',
-    'overflow:hidden'
+    'overflow:hidden',
+    'display:none'
   ].join(';')
+  // The panel renders BELOW the launcher tab so it can slide out from the
+  // window edge underneath it.
+  root.style.zIndex = '2147483646'
   container.appendChild(root)
+
+  // Sticky launcher button — the drawer's handle tab. Lives on a window
+  // edge (left/right) flush to it; the panel docks flush against its inner
+  // side and slides out from the edge UNDER the tab, so button + panel read
+  // as one continuous drawer. Dragging it vertically moves the whole thing.
+  const launcher = ownerDoc.createElement('button')
+  launcher.type = 'button'
+  launcher.className = 'ypw-launcher'
+  launcher.title = 'topology'
+  launcher.style.cssText = [
+    'position:fixed',
+    'z-index:2147483647',
+    'display:inline-flex',
+    'align-items:center',
+    'gap:6px',
+    'padding:8px 10px',
+    'background:#181825f2',
+    'backdrop-filter:blur(8px)',
+    'color:#cdd6f4',
+    'font:12px ui-monospace,SFMono-Regular,Menlo,monospace',
+    'border:1px solid #45475a',
+    'cursor:grab',
+    'touch-action:none',
+    'user-select:none',
+    'box-shadow:0 4px 16px #000a'
+  ].join(';')
+  launcher.innerHTML = `${icon('globe', 15)}<span class="ypw-launcher-badge" style="display:none;min-width:15px;height:15px;padding:0 4px;border-radius:999px;background:#89b4fa;color:#1e1e2e;font-size:9.5px;font-weight:bold;align-items:center;justify-content:center;flex-shrink:0"></span>`
+  container.appendChild(launcher)
 
   const BTN = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#313244;border:1px solid #585b70;color:#cdd6f4;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
   const BTN_DANGER = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#45243a;border:1px solid #f38ba8;color:#f38ba8;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
   const BTN_OK = 'ypw-btn display:inline-flex;align-items:center;gap:4px;cursor:pointer;background:#1e3328;border:1px solid #a6e3a1;color:#a6e3a1;border-radius:8px;padding:4px 8px;font:11px ui-monospace,monospace'
 
   root.innerHTML = `
-    <div class="ypw-header" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;cursor:grab;border-bottom:1px solid #45475a;gap:8px">
+    <div class="ypw-header" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #45475a;gap:8px">
       <span class="ypw-title" style="flex-shrink:0;font-weight:bold;display:inline-flex;align-items:center;gap:5px">${icon('globe', 13)} topology</span>
       <span class="ypw-selfchip" style="flex:1;display:inline-flex;align-items:center;gap:6px;justify-content:flex-end;min-width:0;cursor:pointer" title="inspect yourself"></span>
-      <button class="ypw-collapse" title="collapse" style="flex-shrink:0;cursor:pointer;background:none;border:none;color:#cdd6f4;font:inherit;padding:0 2px;line-height:1">▾</button>
     </div>
-    <div class="ypw-body" style="display:flex;min-height:240px">
-      <div class="ypw-left" style="flex:1.2;min-width:0;display:flex;flex-direction:column;border-right:1px solid #313244">
-        <svg class="ypw-graph" width="100%" height="200" style="display:block;flex-shrink:0"></svg>
-        <div class="ypw-controls" style="display:flex;gap:6px;padding:8px 10px;border-top:1px solid #313244;margin-top:auto">
+    <div class="ypw-body" style="display:flex;flex-direction:column">
+      <div class="ypw-left" style="display:flex;flex-direction:column;border-bottom:1px solid #313244">
+        <svg class="ypw-graph" width="100%" height="220" style="display:block;flex-shrink:0"></svg>
+        <div class="ypw-controls" style="display:flex;gap:6px;padding:8px 10px;border-top:1px solid #313244">
           <input class="ypw-target ypw-input" placeholder="peer id…" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:5px 8px;outline:none" />
           <button class="ypw-connect ypw-btn" title="connect to peer" style="${BTN}">${icon('plug', 12)}</button>
+          <button class="ypw-reset ypw-btn" title="reset node positions" style="${BTN}">${icon('reset', 12)}</button>
         </div>
       </div>
-      <div class="ypw-right" style="flex:1;min-width:0;display:flex;flex-direction:column">
-        <div class="ypw-right-head" style="padding:6px 10px;border-bottom:1px solid #313244;display:flex;flex-direction:column;gap:2px"></div>
-        <div class="ypw-right-body ypw-scroll" style="flex:1;overflow-y:auto;padding:4px 6px"></div>
+      <div class="ypw-right" style="display:flex;flex-direction:column">
+        <div class="ypw-right-head" style="padding:6px 10px;display:flex;flex-direction:column;gap:2px"></div>
+        <div class="ypw-right-body ypw-scroll" style="max-height:190px;overflow-y:auto;padding:4px 6px"></div>
       </div>
     </div>
   `
 
-  const headerEl = root.querySelector<HTMLElement>('.ypw-header')!
   const selfChip = root.querySelector<HTMLElement>('.ypw-selfchip')!
-  const collapseBtn = root.querySelector<HTMLButtonElement>('.ypw-collapse')!
-  const bodyEl = root.querySelector<HTMLElement>('.ypw-body')!
   const graphEl = root.querySelector<SVGSVGElement>('.ypw-graph')!
   const targetInput = root.querySelector<HTMLInputElement>('.ypw-target')!
   const connectBtn = root.querySelector<HTMLButtonElement>('.ypw-connect')!
+  const resetBtn = root.querySelector<HTMLButtonElement>('.ypw-reset')!
   const rightHead = root.querySelector<HTMLElement>('.ypw-right-head')!
   const rightBody = root.querySelector<HTMLElement>('.ypw-right-body')!
+  const launcherBadge = launcher.querySelector<HTMLElement>('.ypw-launcher-badge')!
 
   // --- hover tooltip (shared by all nodes, created once) ------------------
   const tip = host.ownerDocument.createElement('div')
@@ -299,40 +353,150 @@ export function createTopologyWidget ({
   ].join(';')
   host.ownerDocument.body.appendChild(tip)
 
-  // --- collapsing ---------------------------------------------------------
-  function applyCollapsed (): void {
-    bodyEl.style.display = collapsed ? 'none' : ''
-    collapseBtn.textContent = collapsed ? '▸' : '▾'
-    collapseBtn.title = collapsed ? 'expand' : 'collapse'
-    root.style.borderRadius = collapsed ? '999px' : '12px'
+  // --- sticky launcher + panel positioning ---------------------------------
+  // The launcher sticks to a window edge (left or right) at a draggable
+  // vertical position; the panel opens adjacent to it, clamped to the
+  // viewport. Click = toggle panel, drag = move along the edge, crossing
+  // the viewport midline flips sides.
+  let expanded = !startCollapsed
+  let side: 'left' | 'right' = 'right'
+  let stickY = position.y
+
+  const vw = (): number => view?.innerWidth ?? 1200
+  const vh = (): number => view?.innerHeight ?? 800
+
+  function placeLauncher (): void {
+    const h = launcher.offsetHeight || 34
+    const max = Math.max(0, vh() - h - PANEL_MARGIN)
+    stickY = Math.max(PANEL_MARGIN, Math.min(stickY, max))
+    launcher.style.top = `${stickY}px`
+    if (side === 'left') {
+      launcher.style.left = '0px'
+      launcher.style.right = ''
+      launcher.style.borderRadius = '0 10px 10px 0'
+      launcher.style.borderLeftColor = 'transparent'
+    } else {
+      launcher.style.right = '0px'
+      launcher.style.left = ''
+      launcher.style.borderRadius = '10px 0 0 10px'
+      launcher.style.borderRightColor = 'transparent'
+    }
+    launcher.style.boxShadow = '0 4px 16px #000a'
   }
 
-  function setCollapsed (next: boolean): void {
-    if (collapsed === next) return
-    collapsed = next
-    applyCollapsed()
-    onToggleCollapsed?.(collapsed)
+  // Floating panel model: the launcher button stays visible and the panel
+  // opens as a floating window anchored next to it (on the button's inner
+  // side). The panel is clamped to the viewport so it can never end up
+  // partially (or fully) off-screen, even on tiny windows or after resizes.
+  function placePanel (): void {
+    if (!expanded) return
+    const ph = root.offsetHeight || 340
+    const pw = root.offsetWidth || PANEL_W
+    // Anchor: on the side of the button facing into the viewport.
+    const lr = launcher.getBoundingClientRect()
+    const rawLeft = side === 'right' ? lr.left - pw - PANEL_MARGIN : lr.right + PANEL_MARGIN
+    const left = Math.max(PANEL_MARGIN, Math.min(rawLeft, vw() - pw - PANEL_MARGIN))
+    const top = Math.max(PANEL_MARGIN, Math.min(lr.top, vh() - ph - PANEL_MARGIN))
+    root.style.left = `${left}px`
+    root.style.top = `${top}px`
+    root.style.right = ''
   }
 
-  collapseBtn.addEventListener('click', (e) => {
-    e.stopPropagation()
-    setCollapsed(!collapsed)
+  function applyExpanded (): void {
+    root.style.display = expanded ? '' : 'none'
+    // The launcher stays visible: it becomes the toggle for the floating
+    // panel (click again to close), so there is no modal/backdrop step.
+    if (expanded) {
+      placePanel()
+      // Open animation: the panel pops out of the button — quick scale-up
+      // + fade from the button's corner.
+      if (typeof root.animate === 'function') {
+        root.animate(
+          [
+            { opacity: '0', transform: 'scale(0.85) translateY(8px)' },
+            { opacity: '1', transform: 'scale(1) translateY(0)' }
+          ],
+          { duration: 180, easing: 'cubic-bezier(0.2, 0.9, 0.3, 1)' }
+        )
+      }
+    }
+  }
+
+  function setExpanded (next: boolean): void {
+    if (expanded === next) return
+    expanded = next
+    applyExpanded()
+    onToggleCollapsed?.(!expanded)
+  }
+
+  launcher.addEventListener('click', () => {
+    if (launcherJustDragged) {
+      launcherJustDragged = false
+      return
+    }
+    setExpanded(!expanded)
   })
 
-  // --- dragging -----------------------------------------------------------
-  let dragOffset: { dx: number, dy: number } | null = null
-  headerEl.addEventListener('pointerdown', (e) => {
-    if (e.target === collapseBtn) return
-    const rect = root.getBoundingClientRect()
-    dragOffset = { dx: e.clientX - rect.left, dy: e.clientY - rect.top }
-    headerEl.setPointerCapture(e.pointerId)
+  // Escape closes the floating panel (convenience).
+  const onKeyClose = (e: KeyboardEvent): void => {
+    if (e.key === 'Escape' && expanded) setExpanded(false)
+  }
+  view?.addEventListener('keydown', onKeyClose)
+
+  // Click outside closes the floating panel: any pointerdown outside the
+  // panel (and not on the launcher — the launcher toggles via its own click
+  // handler) collapses it. Uses pointerdown so it also fires when the click
+  // lands on other widgets/canvas; inside clicks (graph dragging, inputs)
+  // are ignored via the composed-path check.
+  const onPointerDownClose = (e: PointerEvent): void => {
+    if (!expanded) return
+    const target = e.target as Node | null
+    if (!target) return
+    if (root.contains(target) || launcher.contains(target)) return
+    setExpanded(false)
+  }
+  ownerDoc.addEventListener('pointerdown', onPointerDownClose, true)
+
+  // Launcher dragging along the window edge.
+  let launcherDrag: { startY: number, startStickY: number, moved: boolean } | null = null
+  let launcherJustDragged = false
+  launcher.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return
+    launcherDrag = { startY: e.clientY, startStickY: stickY, moved: false }
+    launcher.setPointerCapture(e.pointerId)
+    e.preventDefault()
   })
-  headerEl.addEventListener('pointermove', (e) => {
-    if (!dragOffset) return
-    root.style.left = `${e.clientX - dragOffset.dx}px`
-    root.style.top = `${e.clientY - dragOffset.dy}px`
+  launcher.addEventListener('pointermove', (e) => {
+    if (!launcherDrag) return
+    const dy = e.clientY - launcherDrag.startY
+    if (!launcherDrag.moved && Math.abs(dy) < 4) return
+    launcherDrag.moved = true
+    stickY = launcherDrag.startStickY + dy
+    // Crossing the viewport midline flips the sticky side.
+    const rect = launcher.getBoundingClientRect()
+    const cx = rect.left + rect.width / 2
+    const nextSide: 'left' | 'right' = cx < vw() / 2 ? 'left' : 'right'
+    if (nextSide !== side) {
+      side = nextSide
+      placeLauncher()
+      placePanel()
+    } else {
+      placeLauncher()
+    }
   })
-  headerEl.addEventListener('pointerup', () => { dragOffset = null })
+  const endLauncherDrag = (): void => {
+    if (!launcherDrag) return
+    if (launcherDrag.moved) launcherJustDragged = true
+    launcherDrag = null
+  }
+  launcher.addEventListener('pointerup', endLauncherDrag)
+  launcher.addEventListener('pointercancel', endLauncherDrag)
+
+  // Keep everything inside the viewport on resize.
+  view?.addEventListener('resize', () => {
+    placeLauncher()
+    placePanel()
+  })
 
   // --- topology snapshot --------------------------------------------------
   let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], peers: [], selfAvatar: null, avatars: new Map() }
@@ -345,9 +509,8 @@ export function createTopologyWidget ({
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
     })
-    provider.mesh.forEach((info, peerId) => {
-      if (provider.connections.has(peerId)) return
-      peers.push({ peerId, kind: 'indirect', via: info.via, path: info.path })
+    tracker.getRemotePeers().forEach(({ peerId, path }) => {
+      peers.push({ peerId, kind: 'indirect', path })
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
     })
@@ -372,7 +535,7 @@ export function createTopologyWidget ({
   // --- right panel: list view --------------------------------------------
   function renderList (): void {
     const nDirect = provider.connections.size
-    const nIndirect = provider.mesh.size
+    const nIndirect = snapshot.peers.filter((p) => p.kind === 'indirect').length
 
     rightHead.innerHTML = `
       <div style="display:flex;align-items:center;gap:6px">
@@ -393,7 +556,7 @@ export function createTopologyWidget ({
       const statusIcon = p.kind === 'direct'
         ? (p.synced ? `<span style="color:#a6e3a1">${icon('check', 11)}</span>` : `<span style="color:#f9e2af">${icon('clock', 11)}</span>`)
         : `<span style="opacity:.6">${icon('route', 11)}</span>`
-      const via = p.kind === 'indirect' ? `<span style="opacity:.55;font-size:10px">via ${displayNameFor(p.via!)}</span>` : ''
+      const via = p.kind === 'indirect' ? `<span style="opacity:.55;font-size:10px">via ${displayNameFor(p.path![0])}</span>` : ''
       return `
         <div class="ypw-row${selected}" data-peer="${p.peerId}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer">
           ${statusIcon}
@@ -444,7 +607,7 @@ export function createTopologyWidget ({
       <div style="display:flex;align-items:center;gap:6px">
         <button class="ypw-back ypw-btn" title="back to list" style="cursor:pointer;background:none;border:none;color:#89b4fa;padding:0;display:inline-flex;align-items:center;font:11px ui-monospace,monospace">← peers</button>
         <span style="flex:1"></span>
-        <span style="font-size:10.5px;opacity:.75">${provider.connections.size} direct · ${provider.mesh.size} indirect</span>
+        <span style="font-size:10.5px;opacity:.75">${provider.connections.size} direct · ${snapshot.peers.filter((p) => p.kind === 'indirect').length} indirect</span>
       </div>
     `
 
@@ -484,7 +647,7 @@ export function createTopologyWidget ({
         body += row('globe', 'status', '1 hop away')
       } else if (indirect) {
         body += row('user', 'role', 'indirect · not directly connected')
-        const route = [indirect.via, ...indirect.path!, peerId].join(' → ')
+        const route = [...indirect.path!, peerId].join(' → ')
         body += row('route', 'route', route)
         const hops = (indirect.path?.length ?? 0) + 1
         body += row('globe', 'status', `${hops} hop${hops === 1 ? '' : 's'} away`)
@@ -543,8 +706,48 @@ export function createTopologyWidget ({
     else renderList()
   }
 
-  // --- rendering ----------------------------------------------------------
+  // --- rendering: rAF coalescing + focused-input guard ---------------------
+  // Provider/tracker events can burst (awareness updates especially — one
+  // per cursor move per peer). Coalesce everything into one render per
+  // animation frame, and skip awareness-driven renders entirely when the
+  // avatar-relevant fields (peerId/user.name/user.color per client) didn't
+  // actually change.
+  let renderScheduled = false
+  let lastAwarenessKey = ''
+  let lastRenderedInspected: string | null = null
+  let deferringEditRerender = false
+
+  function scheduleRender (): void {
+    if (renderScheduled) return
+    renderScheduled = true
+    const view = host.ownerDocument.defaultView
+    if (typeof view?.requestAnimationFrame === 'function') {
+      view.requestAnimationFrame(() => {
+        renderScheduled = false
+        renderNow()
+      })
+    } else {
+      renderScheduled = false
+      renderNow()
+    }
+  }
+
+  /** Cheap fingerprint of the awareness state that affects rendering. */
+  function awarenessKey (): string {
+    const parts: string[] = []
+    provider.awareness.getStates().forEach((state, clientId) => {
+      const s = state as Record<string, unknown>
+      const user = s.user as { name?: unknown, color?: unknown } | undefined
+      parts.push(`${clientId}:${String(s.peerId)}:${String(user?.name)}:${String(user?.color)}`)
+    })
+    return parts.sort().join('|')
+  }
+
   function render (): void {
+    scheduleRender()
+  }
+
+  function renderNow (): void {
     snapshot = extractSnapshot()
 
     // Header self chip.
@@ -554,6 +757,15 @@ export function createTopologyWidget ({
       : `<span style="opacity:.6;font-size:10.5px">${snapshot.selfId ? shorten(snapshot.selfId) : 'connecting…'}</span>`
     selfChip.onclick = () => widgetApi.inspect(inspected === 'self' ? null : 'self')
 
+    // Launcher badge: peer count when the panel is closed.
+    const nPeers = snapshot.peers.length + snapshot.connecting.length
+    if (!expanded && nPeers > 0) {
+      launcherBadge.textContent = String(nPeers)
+      launcherBadge.style.display = 'inline-flex'
+    } else {
+      launcherBadge.style.display = 'none'
+    }
+
     // --- left: graph ---
     const ns = 'http://www.w3.org/2000/svg'
     const W = graphEl.clientWidth || 250
@@ -562,35 +774,82 @@ export function createTopologyWidget ({
     const cy = H / 2
 
     const innerR = Math.min(W, H) * 0.27
-    const outerR = Math.min(W, H) * 0.43
     const positions = new Map<string, { x: number, y: number }>()
 
     const directs = snapshot.peers.filter((p) => p.kind === 'direct')
     const indirects = snapshot.peers.filter((p) => p.kind === 'indirect')
+
+    // Route-aware automatic layout: direct peers sit evenly on the inner
+    // ring; each indirect peer is placed on a ring one level beyond its
+    // previous hop, along that hop's outgoing direction. A chain A—B—C—D
+    // then renders as an actual chain radiating outward (A—B, B—C, C—D)
+    // instead of C and D floating at arbitrary angles on the outer ring.
+    // It also preserves the *shape* under this widget's "everything I know
+    // is reachable through my direct neighbors" viewing perspective.
     directs.forEach((p, i) => {
       const angle = (2 * Math.PI * i) / Math.max(directs.length, 1) - Math.PI / 2
       positions.set(p.peerId, { x: cx + innerR * Math.cos(angle), y: cy + innerR * Math.sin(angle) })
     })
-    indirects.forEach((p, i) => {
-      const angle = (2 * Math.PI * i) / Math.max(indirects.length, 1) - Math.PI / 2 + Math.PI / Math.max(indirects.length, 1)
-      positions.set(p.peerId, { x: cx + outerR * Math.cos(angle), y: cy + outerR * Math.sin(angle) })
+    // Indirects, deepest route last so shallower hops are placed first and
+    // deeper nodes can anchor to them.
+    const sortedIndirects = [...indirects].sort((a, b) => a.path!.length - b.path!.length)
+    const ringSlot = new Map<string, number>() // peerId -> next free angle slot per anchor
+    sortedIndirects.forEach((p) => {
+      const prevHop = p.path![p.path!.length - 1]
+      const anchor = positions.get(prevHop) ?? positions.get(p.path![0]) ?? { x: cx, y: cy }
+      const dist = Math.max(innerR + 16, Math.hypot(anchor.x - cx, anchor.y - cy) + 16)
+      // Spread siblings around the anchor: each anchor gets its own slot
+      // counter so two children of B fan out instead of overlapping.
+      const slot = ringSlot.get(prevHop) ?? 0
+      ringSlot.set(prevHop, slot + 1)
+      const siblings = ringSlot.get(prevHop)!
+      const base = Math.atan2(anchor.y - cy, anchor.x - cx)
+      const spread = siblings > 1 ? (slot - (siblings - 1) / 2) * (Math.PI / 6) : 0
+      const angle = base + spread
+      positions.set(p.peerId, {
+        x: Math.max(14, Math.min(W - 14, anchor.x + dist * Math.cos(angle))),
+        y: Math.max(14, Math.min(H - 14, anchor.y + dist * Math.sin(angle)))
+      })
     })
     snapshot.connecting.forEach((peerId, idx) => {
       const angle = Math.PI / 2 + (idx - (snapshot.connecting.length - 1) / 2) * 0.5
       positions.set(peerId, { x: cx + (innerR + 14) * Math.cos(angle), y: cy + (innerR + 14) * Math.sin(angle) })
     })
 
+    // Manual drags override the automatic layout (until reset).
+    savedPositions.forEach((pos, peerId) => {
+      if (positions.has(peerId)) positions.set(peerId, pos)
+    })
+
+    /**
+     * Route highlight: when an indirect peer is inspected, the edge chain
+     * from us to it (… → via → … → dest) is emphasized and everything not
+     * on that route dims — the "how do I actually reach this node" view.
+     */
+    const routeEdges = new Set<string>() // "from>to" pairs on the inspected route
+    let routeDest: string | null = null
+    if (inspected && inspected !== 'self') {
+      const indirect = snapshot.peers.find((p) => p.peerId === inspected && p.kind === 'indirect')
+      if (indirect) {
+        routeDest = inspected
+        const route = [...indirect.path!, inspected]
+        let from = snapshot.selfId ?? ''
+        route.forEach((to) => {
+          routeEdges.add(`${from}>${to}`)
+          from = to
+        })
+      }
+    }
+    const edgeKey = (from: string, to: string): string => `${from}>${to}`
+    const onRoute = (p: GraphPeer): boolean => {
+      if (routeDest === null) return true // no route focus — everything visible
+      if (p.kind === 'direct') return routeEdges.has(edgeKey(snapshot.selfId ?? '', p.peerId)) || routeEdges.has(edgeKey(p.peerId, snapshot.selfId ?? ''))
+      const prev = p.path!.length > 1 ? p.path![p.path!.length - 2] : (snapshot.selfId ?? '')
+      return routeEdges.has(edgeKey(prev, p.peerId))
+    }
+
     const svg = document.createElementNS(ns, 'svg')
     svg.setAttribute('viewBox', `0 0 ${W} ${H}`)
-    svg.innerHTML =
-      `<defs>
-        <marker id="ypw-arrow-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#a6e3a1"/>
-        </marker>
-        <marker id="ypw-arrow-pending" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#f9e2af"/>
-        </marker>
-      </defs>`
 
     // Edges.
     snapshot.peers.forEach((p) => {
@@ -600,31 +859,39 @@ export function createTopologyWidget ({
       const [x1, y1, x2, y2] = p.kind === 'direct'
         ? (p.direction === 'outgoing' ? [cx, cy, pos.x, pos.y] : [pos.x, pos.y, cx, cy])
         : (() => {
-            const viaPos = positions.get(p.via!) ?? { x: cx, y: cy }
-            return [viaPos.x, viaPos.y, pos.x, pos.y]
+            // Draw the dashed edge from the hop right before the destination
+            // (the last intermediate on the route), so a chain A—B—C—D
+            // renders as A—B, B—C, C—D instead of collapsing C and D both
+            // onto B. Falls back to the next hop if it isn't rendered.
+            const prevHop = p.path!.length > 0 ? p.path![p.path!.length - 1] : p.path![0]
+            const prevPos = positions.get(prevHop) ?? positions.get(p.path![0]) ?? { x: cx, y: cy }
+            return [prevPos.x, prevPos.y, pos.x, pos.y]
           })()
       edge.setAttribute('x1', String(x1))
       edge.setAttribute('y1', String(y1))
       edge.setAttribute('x2', String(x2))
       edge.setAttribute('y2', String(y2))
-      const highlight = inspected === p.peerId || inspected === 'self' || (p.kind === 'indirect' && p.via === inspected)
-      edge.setAttribute('stroke', p.kind === 'direct' ? (p.synced ? '#a6e3a1' : '#f9e2af') : '#6c7086')
+      const visible = onRoute(p)
+      const highlight = inspected === p.peerId || inspected === 'self' || (routeDest !== null && visible)
+      edge.setAttribute('stroke', p.kind === 'direct' ? (p.synced ? '#a6e3a1' : '#f9e2af') : (routeDest !== null && visible ? '#89b4fa' : '#6c7086'))
       edge.setAttribute('stroke-width', highlight ? '2.5' : '1.5')
-      edge.setAttribute('opacity', inspected && !highlight ? '0.35' : '1')
+      edge.setAttribute('opacity', routeDest !== null && !visible ? '0.15' : inspected && !highlight ? '0.35' : '1')
       if (p.kind === 'indirect') {
         edge.setAttribute('stroke-dasharray', '4 3')
-      } else {
-        edge.setAttribute('marker-end', `url(#ypw-arrow-${p.synced ? 'ok' : 'pending'})`)
       }
       svg.appendChild(edge)
     })
 
     // Nodes: avatar circles only — no text labels, so the topology shape
     // stays readable. Identity (name, id, status) appears on hover via the
-    // shared tooltip, and in full in the detail view on click.
+    // shared tooltip, and in full in the detail view on click. Nodes are
+    // draggable (pointer events, click-vs-drag threshold) to untangle the
+    // automatic layout; positions persist until the reset button is used.
     const nodeFor = (peerId: string, pos: { x: number, y: number }, opts: { color: string, r: number, tooltip: string, dashed?: boolean, ring?: string, cursor?: string }) => {
       const g = document.createElementNS(ns, 'g')
-      g.style.cursor = opts.cursor ?? 'pointer'
+      const offRoute = routeDest !== null && !onRoute(snapshot.peers.find((p) => p.peerId === peerId) ?? ({ peerId, kind: 'direct' } as GraphPeer))
+      g.style.cursor = opts.cursor ?? (offRoute ? 'pointer' : 'grab')
+      if (offRoute) g.setAttribute('opacity', '0.3')
 
       const circle = document.createElementNS(ns, 'circle')
       circle.setAttribute('cx', String(pos.x))
@@ -675,8 +942,62 @@ export function createTopologyWidget ({
         tip.style.display = 'none'
       })
 
+      // Drag handling: pointerdown starts a potential drag; movement beyond
+      // a few px converts it into a real drag (edges and avatar follow the
+      // pointer via transform), a clean pointerup without movement is a
+      // click (inspect). Suppressed while the widget is collapsed or the
+      // node's position is being animated elsewhere.
+      let dragging: { startX: number, startY: number, moved: boolean } | null = null
+      g.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return
+        const rect = graphEl.getBoundingClientRect()
+        const scaleX = rect.width > 0 ? W / rect.width : 1
+        const scaleY = rect.height > 0 ? H / rect.height : 1
+        dragging = { startX: e.clientX * scaleX, startY: e.clientY * scaleY, moved: false }
+        g.setPointerCapture(e.pointerId)
+        e.stopPropagation()
+      })
+      g.addEventListener('pointermove', (e) => {
+        if (!dragging) return
+        const rect = graphEl.getBoundingClientRect()
+        const scaleX = rect.width > 0 ? W / rect.width : 1
+        const scaleY = rect.height > 0 ? H / rect.height : 1
+        const nx = e.clientX * scaleX
+        const ny = e.clientY * scaleY
+        const dx = nx - dragging.startX
+        const dy = ny - dragging.startY
+        if (!dragging.moved && Math.hypot(dx, dy) < 4) return // click threshold
+        dragging.moved = true
+        const clampedX = Math.max(14, Math.min(W - 14, pos.x + dx))
+        const clampedY = Math.max(14, Math.min(H - 14, pos.y + dy))
+        g.setAttribute('transform', `translate(${clampedX - pos.x},${clampedY - pos.y})`)
+      })
+      const endDrag = (e: PointerEvent) => {
+        if (!dragging) return
+        const wasDrag = dragging.moved
+        dragging = null
+        if (!wasDrag) return // plain click — let the click handler run
+        g.releasePointerCapture?.(e.pointerId)
+        // Persist the dragged position (already in viewBox coords — the
+        // translate values were computed against them during pointermove).
+        const m = /translate\(([-\d.]+),([-\d.]+)\)/.exec(g.getAttribute('transform') ?? '')
+        if (m) {
+          const nx = Math.max(14, Math.min(W - 14, pos.x + parseFloat(m[1])))
+          const ny = Math.max(14, Math.min(H - 14, pos.y + parseFloat(m[2])))
+          savedPositions.set(peerId, { x: nx, y: ny })
+          justDragged = true
+          scheduleRender() // snap everything to the saved position cleanly
+        }
+      }
+      g.addEventListener('pointerup', endDrag)
+      g.addEventListener('pointercancel', endDrag)
+
       g.addEventListener('click', (e) => {
         e.stopPropagation()
+        if (justDragged) {
+          justDragged = false // swallow the click that follows a drag
+          return
+        }
         widgetApi.inspect(inspected === peerId ? null : peerId)
       })
       svg.appendChild(g)
@@ -687,7 +1008,7 @@ export function createTopologyWidget ({
       const name = av && av.name !== p.peerId ? av.name : null
       const status = p.kind === 'direct'
         ? (p.synced ? 'direct · synced' : 'direct · syncing…')
-        : `indirect · via ${displayNameFor(p.via!)}`
+        : `indirect · via ${displayNameFor(p.path![0])}`
       const who = name ? `${name} <span style="opacity:.6">${shorten(p.peerId)}</span>` : shorten(p.peerId)
       return `<div>${who}</div><div style="opacity:.7">${status}</div>`
     }
@@ -715,7 +1036,7 @@ export function createTopologyWidget ({
       })
     })
     const selfTooltip = selfAv
-      ? `<div>${selfAv.name} <span style="opacity:.6">${shorten(snapshot.selfId ?? '')}</span></div><div style="opacity:.7">you · ${provider.connections.size} direct · ${provider.mesh.size} indirect</div>`
+      ? `<div>${selfAv.name} <span style="opacity:.6">${shorten(snapshot.selfId ?? '')}</span></div><div style="opacity:.7">you · ${provider.connections.size} direct · ${snapshot.peers.filter((p) => p.kind === 'indirect').length} indirect</div>`
       : '<div>you · connecting…</div>'
     nodeFor(snapshot.selfId ?? 'self', { x: cx, y: cy }, {
       color: selfAv?.color ?? '#89b4fa',
@@ -727,10 +1048,36 @@ export function createTopologyWidget ({
     graphEl.replaceChildren(svg)
 
     // --- right: list or detail ---
-    renderRight()
+    // Focused-input guard: while the user is editing an input in the right
+    // panel (name, color picker…), don't wipe its innerHTML — that would
+    // destroy the element mid-keystroke and lose focus + input. Defer the
+    // panel re-render until focus leaves the input. The graph/header still
+    // update above; a real view change (different inspected peer) forces
+    // the render through anyway.
+    const active = host.ownerDocument.activeElement as HTMLElement | null
+    const editing = !!active && (rightBody.contains(active) || rightHead.contains(active)) &&
+      (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT')
+    if (editing && inspected === lastRenderedInspected) {
+      if (!deferringEditRerender) {
+        deferringEditRerender = true
+        active.addEventListener('focusout', () => {
+          deferringEditRerender = false
+          scheduleRender()
+        }, { once: true })
+      }
+    } else {
+      deferringEditRerender = false
+      renderRight()
+    }
+    lastRenderedInspected = inspected
+    lastAwarenessKey = awarenessKey()
   }
 
   // --- controls -----------------------------------------------------------
+  resetBtn.addEventListener('click', () => {
+    savedPositions.clear()
+    render()
+  })
   connectBtn.addEventListener('click', () => {
     const target = targetInput.value.trim()
     if (!target) return
@@ -742,27 +1089,42 @@ export function createTopologyWidget ({
   })
 
   // --- provider wiring ----------------------------------------------------
-  const events = ['peers', 'status', 'synced', 'connection-error', 'mesh'] as const
+  const events = ['peers', 'status', 'synced', 'connection-error'] as const
   events.forEach((name) => provider.on(name, render as () => void))
-  provider.awareness.on('update', render as () => void)
-  applyCollapsed()
+  const onTrackerChanged = (_remotePeers: RemotePeerInfo[]) => render()
+  tracker.on('changed', onTrackerChanged)
+  const onAwarenessUpdate = () => {
+    // Only re-render when avatar-relevant awareness changed — cursor/presence
+    // noise is ignored, and bursts within one frame collapse via scheduleRender.
+    if (awarenessKey() !== lastAwarenessKey) render()
+  }
+  provider.awareness.on('update', onAwarenessUpdate)
+  applyExpanded()
+  placeLauncher()
   render()
 
   const widgetApi: TopologyWidget = {
     getSnapshot: () => snapshot,
     refresh: render,
-    isCollapsed: () => collapsed,
-    setCollapsed,
+    isCollapsed: () => !expanded,
+    setCollapsed (next: boolean) {
+      setExpanded(!next)
+    },
     getInspected: () => inspected,
     inspect (peerId) {
       inspected = peerId
-      if (peerId && collapsed) setCollapsed(false)
+      if (peerId && !expanded) setExpanded(true)
       render()
     },
     destroy () {
       events.forEach((name) => provider.off(name, render as (...args: unknown[]) => void))
-      provider.awareness.off('update', render as (...args: unknown[]) => void)
+      tracker.off('changed', onTrackerChanged)
+      if (ownsTracker) tracker.destroy()
+      provider.awareness.off('update', onAwarenessUpdate)
+      view?.removeEventListener('keydown', onKeyClose)
+      ownerDoc.removeEventListener('pointerdown', onPointerDownClose, true)
       tip.remove()
+      launcher.remove()
       root.remove()
     }
   }

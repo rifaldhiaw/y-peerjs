@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import * as Y from 'yjs'
 import { PeerjsProvider } from '../src/lib/index.js'
+import { TopologyTracker } from '../src/lib/widget/TopologyTracker.js'
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -232,7 +233,7 @@ describe('PeerjsProvider', () => {
     expect(providerA.connectedPeers.length).toBe(0)
   })
 
-  it('mesh protocol: indirect peers learned via announcements with correct via/path', async () => {
+  it('topology tracker: indirect peers learned via announcements with correct full paths', async () => {
     // Chain: A -- B -- C. A and C are not directly connected, but each
     // should learn about the other through B's announcements.
     const docA = new Y.Doc()
@@ -243,37 +244,129 @@ describe('PeerjsProvider', () => {
     const providerC = new PeerjsProvider(docC, { peerId: 'chain-c' })
     await Promise.all([providerA.whenReady, providerB.whenReady, providerC.whenReady])
 
+    const trackerA = new TopologyTracker(providerA)
+    const trackerB = new TopologyTracker(providerB)
+    const trackerC = new TopologyTracker(providerC)
+
     await Promise.all([providerA.connect('chain-b'), providerC.connect('chain-b')])
 
-    // Wait for mesh announcements to propagate (interval is 10s but each
-    // peer announces immediately when its neighborhood changes).
+    // Wait for routing announcements to propagate (interval is 10s but each
+    // peer announces immediately when its routing view changes).
     await wait(200)
 
-    // A sees C as indirect, via B. `path` holds intermediates between the
-    // next hop and the destination — none in a 2-hop chain.
-    const aViewOfC = providerA.mesh.get('chain-c')
-    expect(aViewOfC).toBeDefined()
-    expect(aViewOfC!.via).toBe('chain-b')
-    expect(aViewOfC!.path).toEqual([])
-    // C sees A as indirect, via B.
-    const cViewOfA = providerC.mesh.get('chain-a')
-    expect(cViewOfA).toBeDefined()
-    expect(cViewOfA!.via).toBe('chain-b')
+    // A sees C as indirect via B, with the full intermediates-only path.
+    expect(trackerA.getRemotePeers()).toEqual([{ peerId: 'chain-c', path: ['chain-b'] }])
+    expect(trackerA.getPath('chain-c')).toEqual(['chain-b'])
+    // C sees A the same way.
+    expect(trackerC.getRemotePeers()).toEqual([{ peerId: 'chain-a', path: ['chain-b'] }])
     // B has no indirect peers — it's directly connected to both.
-    expect(providerB.mesh.size).toBe(0)
-    // neighborTables: B heard full tables from both A and C.
-    expect(providerB.neighborTables.get('chain-a')?.has('chain-a')).toBe(true)
-    expect(providerB.neighborTables.get('chain-c')?.has('chain-c')).toBe(true)
+    expect(trackerB.getRemotePeers()).toEqual([])
 
-    // Dropping B-C means C vanishes from A's mesh (it was only reachable
-    // through B) and B's table from C is discarded.
+    // Dropping B-C means C vanishes from A's view (it was only reachable
+    // through B).
     providerC.disconnect('chain-b')
     await wait(50)
-    expect(providerA.mesh.has('chain-c')).toBe(false)
-    expect(providerB.neighborTables.has('chain-c')).toBe(false)
+    expect(trackerA.getRemotePeers()).toEqual([])
 
+    trackerA.destroy()
+    trackerB.destroy()
+    trackerC.destroy()
     providerA.destroy()
     providerB.destroy()
     providerC.destroy()
+  })
+
+  it('topology tracker: multi-hop route renders as a full path (A-B-C-D chain)', async () => {
+    const peers: PeerjsProvider[] = []
+    const trackers: TopologyTracker[] = []
+    const ids = ['hop-a', 'hop-b', 'hop-c', 'hop-d']
+    for (const id of ids) {
+      const provider = new PeerjsProvider(new Y.Doc(), { peerId: id })
+      await provider.whenReady
+      peers.push(provider)
+      trackers.push(new TopologyTracker(provider))
+    }
+    // Build the chain A--B--C--D.
+    await peers[0].connect('hop-b')
+    await peers[1].connect('hop-c')
+    await peers[2].connect('hop-d')
+    await wait(250)
+
+    // A's view of D must be the full route through B and C — this is what
+    // the widget needs to draw A-B, B-C, C-D edges instead of collapsing
+    // C and D both onto B.
+    expect(trackers[0].getPath('hop-d')).toEqual(['hop-b', 'hop-c'])
+    expect(trackers[0].getPath('hop-c')).toEqual(['hop-b'])
+    expect(trackers[3].getPath('hop-a')).toEqual(['hop-c', 'hop-b'])
+    // Middle peers know the far end of the chain as indirect (B's direct
+    // neighbors are A and C, so D is indirect via C — and vice versa).
+    expect(trackers[1].getRemotePeers()).toEqual([{ peerId: 'hop-d', path: ['hop-c'] }])
+    expect(trackers[2].getRemotePeers()).toEqual([{ peerId: 'hop-a', path: ['hop-b'] }])
+
+    // Shortest route wins: if D connects directly to A, the A->D view
+    // collapses to a direct connection (no longer indirect). C stays
+    // indirect, reachable via B.
+    await peers[3].connect('hop-a')
+    await wait(250)
+    expect(trackers[0].getPath('hop-d')).toBeUndefined() // now direct
+    expect(trackers[0].getPath('hop-c')).toEqual(['hop-b'])
+
+    peers.forEach((p) => p.destroy())
+    trackers.forEach((t) => t.destroy())
+  })
+
+  it('topology tracker: retractions propagate when a middle peer drops a link', async () => {
+    const peers: PeerjsProvider[] = []
+    const trackers: TopologyTracker[] = []
+    const ids = ['ret-a', 'ret-b', 'ret-c']
+    for (const id of ids) {
+      const provider = new PeerjsProvider(new Y.Doc(), { peerId: id })
+      await provider.whenReady
+      peers.push(provider)
+      trackers.push(new TopologyTracker(provider))
+    }
+    await peers[0].connect('ret-b')
+    await peers[2].connect('ret-b')
+    await wait(200)
+    expect(trackers[0].getRemotePeers()).toEqual([{ peerId: 'ret-c', path: ['ret-b'] }])
+
+    // B drops A: A no longer hears from B, so C must vanish from A's view
+    // even though A↔B is gone too (route learning stops at the edge).
+    peers[1].disconnect('ret-a')
+    await wait(100)
+    expect(trackers[0].getRemotePeers()).toEqual([])
+
+    peers.forEach((p) => p.destroy())
+    trackers.forEach((t) => t.destroy())
+  })
+
+  it('topology tracker: tracker messages do not leak into app message handlers', async () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    const providerA = new PeerjsProvider(docA, { peerId: 'tlk-a' })
+    const providerB = new PeerjsProvider(docB, { peerId: 'tlk-b' })
+    await Promise.all([providerA.whenReady, providerB.whenReady])
+
+    const trackerA = new TopologyTracker(providerA)
+    const trackerB = new TopologyTracker(providerB)
+    await providerA.connect('tlk-b')
+    await waitForEvent(providerA, 'synced', ({ peerId }) => peerId === 'tlk-b')
+    await wait(150) // let tracker announcements flow
+
+    // App-level message still arrives intact despite tracker traffic.
+    const gotMessage = waitForEvent(providerB, 'message', ({ peerId }) => peerId === 'tlk-a')
+    providerA.send('tlk-b', 'ping')
+    const { data } = await gotMessage
+    expect(new TextDecoder().decode(data)).toBe('ping')
+
+    // And a Uint8Array app payload that merely happens to be bytes, not a
+    // tracker-prefixed string, is ignored by the tracker.
+    expect(trackerA.getPath('tlk-b')).toBeUndefined() // direct, not indirect
+    expect(trackerB.getRemotePeers()).toEqual([])
+
+    trackerA.destroy()
+    trackerB.destroy()
+    providerA.destroy()
+    providerB.destroy()
   })
 })
