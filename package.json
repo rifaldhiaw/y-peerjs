@@ -1,0 +1,57 @@
+{
+  "name": "y-peerjs",
+  "version": "0.1.0",
+  "description": "A Yjs connection provider built on PeerJS — like y-webrtc, but with explicit connect(id)/disconnect(id) control instead of room-based signaling. Includes a floating topology widget.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./widget": {
+      "types": "./dist/widget/index.d.ts",
+      "import": "./dist/widget/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "yjs",
+    "peerjs",
+    "webrtc",
+    "crdt",
+    "collaboration",
+    "y-webrtc",
+    "realtime"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lib0": "^0.2.85"
+  },
+  "peerDependencies": {
+    "yjs": "^13.6.0",
+    "y-protocols": "^1.0.5",
+    "peerjs": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "peerjs": "^1.5.4",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "vite-plugin-dts": "^4.5.0",
+    "vitest": "^5.0.1",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.18"
+  }
+}
