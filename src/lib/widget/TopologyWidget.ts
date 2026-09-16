@@ -24,6 +24,17 @@ export interface GraphPeer {
   path?: string[]
 }
 
+/** A peer remembered after it left the mesh, so the UI can offer reconnect. */
+export interface RecentPeerInfo {
+  peerId: string
+  /** Last known display name from awareness, if any. */
+  name?: string
+  /** Last known avatar color from awareness, if any. */
+  color?: string
+  /** When we last saw this peer connected (ms epoch). */
+  lastSeen: number
+}
+
 /**
  * Snapshot of the full connection topology: direct links plus the complete
  * reachable topology learned via the TopologyTracker's discovery protocol.
@@ -41,6 +52,12 @@ export interface TopologySnapshot {
   selfAvatar: PeerAvatar | null
   /** Avatars for connected peers, keyed by peer id (empty when unknown). */
   avatars: Map<string, PeerAvatar>
+  /**
+   * Recently-seen peers that are no longer in the mesh, most recent first.
+   * The graph only shows live/connecting peers; these appear in the list's
+   * "recent" section with a one-click reconnect button.
+   */
+  recent: RecentPeerInfo[]
 }
 
 export interface TopologyWidgetOptions {
@@ -69,6 +86,10 @@ export interface TopologyWidgetOptions {
    * always available in the detail view (with a copy button).
    */
   shortIdLength?: number
+  /** How long a disconnected peer stays in the "recent" list (ms). Default 300000 (5 min). */
+  recentTimeoutMs?: number
+  /** Maximum number of peers kept in the "recent" list. Default 10. */
+  maxRecentPeers?: number
 }
 
 /** Small inline icon set (stroke-based, 24x24 viewBox). */
@@ -177,7 +198,9 @@ export function createTopologyWidget ({
   startCollapsed = true,
   onToggleCollapsed,
   fallbackColor = '#a6e3a1',
-  shortIdLength = 6
+  shortIdLength = 6,
+  recentTimeoutMs = 5 * 60 * 1000,
+  maxRecentPeers = 10
 }: TopologyWidgetOptions): TopologyWidget {
   if (!container) throw new Error('TopologyWidget requires a DOM container')
   ensureStyles(container.ownerDocument ?? document)
@@ -193,6 +216,56 @@ export function createTopologyWidget ({
   let justDragged = false
 
   let inspected: string | null = null
+
+  // --- recent peers: remember who left so reconnect is one click ----------
+  // Disconnected peers disappear from the graph immediately (dead nodes
+  // clutter the topology and read as "still connected"). Instead they land
+  // in a small "recent" section at the bottom of the list — with their last
+  // known name/color — until recentTimeoutMs passes, then they expire.
+  const recent = new Map<string, RecentPeerInfo>() // peerId -> info
+  /**
+   * Why a connect attempt failed, by peer id. Rendered in the list/detail so
+   * "connecting…" never hangs silently — peer-unavailable and timeouts both
+   * surface a concrete message.
+   */
+  const lastFailure = new Map<string, string>() // peerId -> message
+
+  const cleanFailureMessage = (err: unknown): string => {
+    const raw = err instanceof Error ? err.message : String(err)
+    return raw
+      .replace(/^Could not connect to peer\s+/i, '')
+      .replace(/^Could not connect to peer\s+\S+\s*/i, '')
+      .trim() || raw
+  }
+
+  function rememberPeer (peerId: string): void {
+    if (provider.connections.has(peerId) || provider.connecting.has(peerId)) return
+    const av = avatarFor(peerId)
+    recent.set(peerId, {
+      peerId,
+      name: av && av.name !== peerId ? av.name : undefined,
+      color: av?.color,
+      lastSeen: Date.now()
+    })
+    while (recent.size > maxRecentPeers) {
+      const oldest = [...recent.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0]
+      if (oldest === undefined) break
+      recent.delete(oldest.peerId)
+      if (inspected === oldest.peerId) widgetApi.inspect(null)
+    }
+  }
+
+  // Expire stale entries lazily on each snapshot — no timer needed.
+  function pruneRecent (): void {
+    const now = Date.now()
+    recent.forEach((info, peerId) => {
+      if (now - info.lastSeen > recentTimeoutMs) {
+        recent.delete(peerId)
+        lastFailure.delete(peerId)
+        savedPositions.delete(peerId)
+      }
+    })
+  }
 
   const shorten = (id: string): string =>
     id.length <= shortIdLength * 2 + 1 ? id : `${id.slice(0, shortIdLength)}…${id.slice(-shortIdLength)}`
@@ -499,9 +572,10 @@ export function createTopologyWidget ({
   })
 
   // --- topology snapshot --------------------------------------------------
-  let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], peers: [], selfAvatar: null, avatars: new Map() }
+  let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], peers: [], selfAvatar: null, avatars: new Map(), recent: [] }
 
   function extractSnapshot (): TopologySnapshot {
+    pruneRecent()
     const peers: GraphPeer[] = []
     const avatars = new Map<string, PeerAvatar>()
     provider.connections.forEach(({ synced, direction }, peerId) => {
@@ -514,13 +588,25 @@ export function createTopologyWidget ({
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
     })
+    // Anything live or connecting is not "recent" — covers both directions
+    // of churn (we connected to them / they connected to us).
+    peers.forEach((p) => {
+      recent.delete(p.peerId)
+      lastFailure.delete(p.peerId)
+    })
+    provider.connecting.forEach((peerId) => {
+      recent.delete(peerId)
+      lastFailure.delete(peerId)
+    })
+    const recentPeers = [...recent.values()].sort((a, b) => b.lastSeen - a.lastSeen)
     return {
       selfId: provider.id ?? null,
       status: provider.peer.open ? 'peer-open' : 'idle',
       connecting: Array.from(provider.connecting),
       peers,
       selfAvatar: avatarFor(provider.id ?? '') ?? null,
-      avatars
+      avatars,
+      recent: recentPeers
     }
   }
 
@@ -574,10 +660,33 @@ export function createTopologyWidget ({
         ${avatarChip(undefined, peerId, 22)}
         <span style="flex:1">${shorten(peerId)}</span>
         <span style="font-size:10.5px">connecting…</span>
+        <button class="ypw-row-cancel" title="cancel connect" style="cursor:pointer;background:none;border:none;color:#f38ba8;padding:2px;display:inline-flex">${icon('x', 12)}</button>
       </div>
     `).join('')
 
-    rightBody.innerHTML = snapshot.peers.map(row).join('') + connectingRows
+    const recentRows = snapshot.recent.map((r) => {
+      const failure = lastFailure.get(r.peerId)
+      const chip = `<span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:${r.color ?? fallbackColor};opacity:.45;color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:9px;flex-shrink:0">${r.name ? r.name.slice(0, 2).toUpperCase() : r.peerId.slice(0, 2).toUpperCase()}</span>`
+      const label = r.name ? `<strong style="opacity:.75">${r.name}</strong> <span style="opacity:.45;font-size:10.5px">${shorten(r.peerId)}</span>` : `<span style="opacity:.75">${shorten(r.peerId)}</span>`
+      const meta = failure
+        ? `<span style="color:#f38ba8;font-size:10px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${failure}">${failure}</span>`
+        : `<span style="opacity:.45;font-size:10px">${Math.round((Date.now() - r.lastSeen) / 1000)}s ago</span>`
+      return `
+        <div class="ypw-row ypw-row-recent" data-peer="${r.peerId}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer;opacity:.85">
+          <span style="opacity:.5">${icon('clock', 11)}</span>
+          ${chip}
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
+          ${meta}
+          <button class="ypw-row-reconnect" title="connect again" style="cursor:pointer;background:none;border:none;color:#a6e3a1;padding:2px;display:inline-flex">${icon('plug', 12)}</button>
+        </div>
+      `
+    }).join('')
+
+    const recentHeader = recentRows
+      ? `<div style="padding:8px 6px 2px;font-size:10px;opacity:.5;text-transform:uppercase;letter-spacing:.05em;display:flex;align-items:center;gap:5px">${icon('clock', 10)} recent — offline / unreachable</div>`
+      : ''
+
+    rightBody.innerHTML = snapshot.peers.map(row).join('') + connectingRows + recentHeader + recentRows
 
     rightBody.querySelectorAll<HTMLElement>('.ypw-row[data-peer]').forEach((el) => {
       const peerId = el.dataset.peer!
@@ -586,7 +695,16 @@ export function createTopologyWidget ({
       el.querySelector('.ypw-row-action')?.addEventListener('click', (e) => {
         e.stopPropagation()
         if (p?.kind === 'direct') provider.disconnect(peerId)
-        else provider.connect(peerId).catch(() => {}) // errors surface via 'connection-error'
+        else provider.connect(peerId).catch(() => {}) // failures surface via 'connection-failed'
+      })
+      el.querySelector('.ypw-row-reconnect')?.addEventListener('click', (e) => {
+        e.stopPropagation()
+        lastFailure.delete(peerId)
+        provider.connect(peerId).catch(() => {}) // failures surface via 'connection-failed'
+      })
+      el.querySelector('.ypw-row-cancel')?.addEventListener('click', (e) => {
+        e.stopPropagation()
+        provider.disconnect(peerId) // clears the pending connect attempt
       })
     })
   }
@@ -654,8 +772,11 @@ export function createTopologyWidget ({
       } else if (connecting) {
         body += row('clock', 'status', 'connecting…')
       } else {
-        body += row('user', 'role', 'unknown peer')
-        body += row('globe', 'status', 'not in mesh — connect to reach it')
+        const recentInfo = snapshot.recent.find((r) => r.peerId === peerId)
+        const failure = lastFailure.get(peerId)
+        body += row('user', 'role', recentInfo ? 'recent · offline / unreachable' : 'unknown peer')
+        if (failure) body += row('x', 'last try', `<span style="color:#f38ba8">${failure}</span>`)
+        else body += row('globe', 'status', 'not in mesh — connect to reach it')
       }
     }
 
@@ -664,7 +785,9 @@ export function createTopologyWidget ({
     if (!isSelf) {
       if (direct) {
         actions = `<button class="ypw-act-dc" style="${BTN_DANGER}">${icon('scissors', 12)} disconnect</button>`
-      } else if (!connecting) {
+      } else if (connecting) {
+        actions = `<button class="ypw-act-cancel" style="${BTN_DANGER}">${icon('x', 12)} cancel</button>`
+      } else {
         actions = `<button class="ypw-act-connect" style="${BTN_OK}">${icon('plug', 12)} connect</button>`
       }
     }
@@ -680,10 +803,18 @@ export function createTopologyWidget ({
     })
     rightBody.querySelector('.ypw-act-dc')?.addEventListener('click', () => {
       provider.disconnect(peerId)
-      widgetApi.inspect(null)
+      rememberPeer(peerId)
+      widgetApi.inspect(peerId) // stay on the peer — now in its recent state
+      render()
+    })
+    rightBody.querySelector('.ypw-act-cancel')?.addEventListener('click', () => {
+      provider.disconnect(peerId) // cancels the in-flight connect attempt
+      rememberPeer(peerId)
+      render()
     })
     rightBody.querySelector('.ypw-act-connect')?.addEventListener('click', () => {
-      provider.connect(peerId).catch(() => {}) // errors surface via 'connection-error'
+      lastFailure.delete(peerId)
+      provider.connect(peerId).catch(() => {}) // failures surface via 'connection-failed'
     })
 
     // Self-edit: persist name/color into awareness.
@@ -1091,6 +1222,23 @@ export function createTopologyWidget ({
   // --- provider wiring ----------------------------------------------------
   const events = ['peers', 'status', 'synced', 'connection-error'] as const
   events.forEach((name) => provider.on(name, render as () => void))
+
+  // Remember peers the moment they leave the mesh (either direction) so they
+  // show up in the list's "recent" section for quick reconnecting.
+  const onPeersEvent = ({ removed }: { added: string[], removed: string[] }): void => {
+    removed.forEach((peerId) => rememberPeer(peerId))
+  }
+  provider.on('peers', onPeersEvent)
+  // Surface connect failures concretely: 'connection-failed' is the definitive
+  // "this will not succeed" signal (peer-unavailable, timeout) vs generic
+  // connection errors which may still recover.
+  const onConnectionFailed = (err: unknown, peerId: string): void => {
+    lastFailure.set(peerId, cleanFailureMessage(err))
+    provider.connecting.delete(peerId)
+    render()
+  }
+  provider.on('connection-failed', onConnectionFailed as (...args: unknown[]) => void)
+
   const onTrackerChanged = (_remotePeers: RemotePeerInfo[]) => render()
   tracker.on('changed', onTrackerChanged)
   const onAwarenessUpdate = () => {
@@ -1118,6 +1266,8 @@ export function createTopologyWidget ({
     },
     destroy () {
       events.forEach((name) => provider.off(name, render as (...args: unknown[]) => void))
+      provider.off('peers', onPeersEvent)
+      provider.off('connection-failed', onConnectionFailed as (...args: unknown[]) => void)
       tracker.off('changed', onTrackerChanged)
       if (ownsTracker) tracker.destroy()
       provider.awareness.off('update', onAwarenessUpdate)

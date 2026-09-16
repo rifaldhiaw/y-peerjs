@@ -16,6 +16,7 @@ class DataConnection extends EventEmitter {
     this.metadata = metadata
     this.open = false
     this._other = null // paired DataConnection
+    this._dead = false // set when the owning peer hard-crashes
   }
 
   _link (other) {
@@ -28,7 +29,7 @@ class DataConnection extends EventEmitter {
   }
 
   send (data) {
-    if (!this.open || !this._other) return
+    if (!this.open || !this._other || this._dead) return
     // Capture the paired connection now: it may be closed (and unlink us)
     // before the delayed delivery fires.
     const other = this._other
@@ -56,6 +57,7 @@ export class Peer extends EventEmitter {
     this.options = options
     this.id = typeof id === 'string' && id.length > 0 ? id : randomId()
     this.destroyed = false
+    this._conns = new Set() // every DataConnection owned by this peer
     setTimeout(() => {
       if (this.destroyed) return
       registry.set(this.id, this)
@@ -65,6 +67,7 @@ export class Peer extends EventEmitter {
 
   connect (targetId, opts = {}) {
     const localConn = new DataConnection(targetId, opts.metadata)
+    this._conns.add(localConn)
     setTimeout(() => {
       const target = registry.get(targetId)
       if (!target || target.destroyed) {
@@ -72,6 +75,7 @@ export class Peer extends EventEmitter {
         return
       }
       const remoteConn = new DataConnection(this.id, opts.metadata)
+      target._conns.add(remoteConn)
       localConn._link(remoteConn)
       remoteConn._link(localConn)
       target.emit('connection', remoteConn)
@@ -83,6 +87,19 @@ export class Peer extends EventEmitter {
 
   disconnect () {
     this.emit('disconnected')
+  }
+
+  // Simulates a hard crash / closed tab WITHOUT a clean close: the peer
+  // vanishes from the broker registry and goes completely silent, but its
+  // existing DataConnections are NOT closed — no 'close' event ever reaches
+  // the other side (the half-open-connection case liveness detection exists
+  // for). Contrast with destroy(), which closes connections properly.
+  _simulateCrash () {
+    this.destroyed = true
+    registry.delete(this.id)
+    // Silences all of this peer's connections: they neither send nor deliver
+    // anything anymore — exactly like a crashed process / closed tab.
+    this._conns.forEach((conn) => { conn._dead = true })
   }
 
   destroy () {

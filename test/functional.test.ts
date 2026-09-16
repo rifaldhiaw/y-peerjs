@@ -369,4 +369,48 @@ describe('PeerjsProvider', () => {
     providerA.destroy()
     providerB.destroy()
   })
+
+  it('heartbeat reaps a peer that vanishes without closing its connection', async () => {
+    const docA = new Y.Doc()
+    const docB = new Y.Doc()
+    // Short intervals so the test is fast; production defaults are 5s/15s.
+    const providerA = new PeerjsProvider(docA, { peerId: 'alice', heartbeatInterval: 50, heartbeatTimeout: 150 })
+    const providerB = new PeerjsProvider(docB, { peerId: 'bob', heartbeatInterval: 50, heartbeatTimeout: 150 })
+    await Promise.all([providerA.whenReady, providerB.whenReady])
+
+    await providerA.connect('bob')
+    await Promise.all([
+      waitForEvent(providerA, 'synced', ({ peerId }) => peerId === 'bob'),
+      waitForEvent(providerB, 'synced', ({ peerId }) => peerId === 'alice')
+    ])
+    expect(providerA.connectedPeers).toEqual(['bob'])
+
+    // Simulate a crash / closed tab: B vanishes WITHOUT closing its
+    // connection — no 'close' event ever reaches A (half-open connection).
+    // (Cast: _simulateCrash lives only on the test mock.)
+    ;(providerB.peer as unknown as { _simulateCrash(): void })._simulateCrash()
+
+    // A's heartbeat should notice the silence and close its side. B's close
+    // path also unregisters it from the mock registry, so this mirrors a
+    // real vanish: no close event arrives from the network.
+    await waitForEvent(providerA, 'peers', ({ removed }) => removed.includes('bob'))
+    expect(providerA.connectedPeers.length).toBe(0)
+
+    // Liveness must not false-positive on a live, idle connection.
+    const providerC = new PeerjsProvider(docB, { peerId: 'carol', heartbeatInterval: 50, heartbeatTimeout: 150 })
+    const providerD = new PeerjsProvider(docA, { peerId: 'dan', heartbeatInterval: 50, heartbeatTimeout: 150 })
+    await Promise.all([providerC.whenReady, providerD.whenReady])
+    await providerC.connect('dan')
+    await Promise.all([
+      waitForEvent(providerC, 'synced', ({ peerId }) => peerId === 'dan'),
+      waitForEvent(providerD, 'synced', ({ peerId }) => peerId === 'carol')
+    ])
+    await wait(400) // several heartbeat ticks with zero app traffic
+    expect(providerC.connectedPeers).toEqual(['dan'])
+    expect(providerD.connectedPeers).toEqual(['carol'])
+
+    providerC.destroy()
+    providerD.destroy()
+    providerA.destroy()
+  })
 })

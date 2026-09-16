@@ -97,6 +97,8 @@ exact route to them), attach the opt-in `TopologyTracker` (see below).
 | `maxConns`           | `number`   | `20`                | Cap on simultaneous peer connections. |
 | `resyncInterval`     | `number`   | `-1` (disabled)     | If `> 0`, periodically re-sends sync step 1 to all peers (ms). Cheap insurance against missed updates on flaky connections. |
 | `connectionTimeout`  | `number`   | `10000`             | Milliseconds `connect()` waits for the connection to open before rejecting. |
+| `heartbeatInterval`  | `number`   | `5000`              | How often to send liveness pings to connected peers (ms). `0` disables liveness detection. |
+| `heartbeatTimeout`   | `number`   | `15000`             | How long a connection may stay completely silent (no pongs, data, or sync traffic) before it is considered dead and closed. Catches crashes, killed tabs, and network drops that never produce a `close` event. |
 
 ### Instance methods
 
@@ -175,6 +177,7 @@ own string messages with that prefix.
 | `synced` | `[{ peerId }]` | fired once per peer, the first time sync step 2 is processed for them |
 | `peer-error` | `[Error]` | fatal error from the underlying `Peer` object |
 | `connection-error` | `[Error, peerId]` | error on a specific connection (including `connect()` timeouts) |
+| `connection-failed` | `[Error, peerId]` | a `connect()` attempt definitively failed — the peer id is not registered with the broker (`peer-unavailable`) or the attempt timed out |
 | `message-error` | `[Error, peerId]` | malformed/unrecognized message from a peer |
 | `message` | `[{ peerId, data }]` | custom payload received via the peer's `send`/`broadcast` |
 

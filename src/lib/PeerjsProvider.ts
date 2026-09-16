@@ -12,6 +12,8 @@ const messageSync = 0
 const messageAwareness = 1
 const messageQueryAwareness = 2
 const messageCustom = 3
+const messagePing = 4
+const messagePong = 5
 
 // Bound on how many recently-seen fingerprints we remember to stop gossip
 // relay from growing unbounded.
@@ -58,6 +60,10 @@ export interface PeerjsProviderOptions {
   resyncInterval?: number
   /** Milliseconds to wait for a connect() attempt to open before giving up. Default 10000. */
   connectionTimeout?: number
+  /** How often to send liveness pings to connected peers (ms). 0 disables liveness detection. Default 5000. */
+  heartbeatInterval?: number
+  /** How long a connection may stay completely silent before it is considered dead and closed (ms). Default 15000. */
+  heartbeatTimeout?: number
 }
 
 export interface PeersEvent {
@@ -97,6 +103,7 @@ export interface StatusEvent {
  *  - 'synced'            [{ peerId }]                           fired once per peer after first sync completes
  *  - 'peer-error'        [error]                                fatal error from the underlying Peer object
  *  - 'connection-error'  [error, peerId]                        error on a specific DataConnection
+ *  - 'connection-failed' [error, peerId]                        a connect() attempt definitively failed (peer not registered with the broker, or timed out) — the widget uses this to stop showing 'connecting…'
  *  - 'message-error'     [error, peerId]                        malformed/unhandled message from a peer
  *  - 'message'           [{ peerId, data }]                     raw custom messages sent via provider.send()
  * @extends {Observable<string>}
@@ -113,6 +120,8 @@ export class PeerjsProvider extends Observable<string> {
   peer: Peer
   maxConns: number
   connectionTimeout: number
+  heartbeatInterval: number
+  heartbeatTimeout: number
   connections: Map<string, ConnState>
   /** Resolves with our own registered PeerJS id once the broker confirms it. */
   whenReady: Promise<string>
@@ -134,7 +143,9 @@ export class PeerjsProvider extends Observable<string> {
     autoConnectTo = [],
     maxConns = 20,
     resyncInterval = -1,
-    connectionTimeout = 10000
+    connectionTimeout = 10000,
+    heartbeatInterval = 5000,
+    heartbeatTimeout = 15000
   }: PeerjsProviderOptions = {}) {
     super()
 
@@ -147,15 +158,24 @@ export class PeerjsProvider extends Observable<string> {
     this.awareness = awareness || new awarenessProtocol.Awareness(doc)
     this.maxConns = maxConns
     this.connectionTimeout = connectionTimeout
+    this.heartbeatInterval = heartbeatInterval
+    this.heartbeatTimeout = heartbeatTimeout
 
     this.connections = new Map()
     this.connecting = new Set<string>()
+    /** peerId -> timestamp of last inbound traffic (any message), for liveness */
+    this._lastSeen = new Map()
     /** fingerprint -> true, insertion-ordered for LRU eviction */
     this._seenUpdateHashes = new Map<string, true>()
 
     this._destroyed = false
     this._resyncInterval = null
     this._pendingConnects = new Map()
+    this._pendingConns = new Map()
+    this._heartbeatTimer = null
+    if (heartbeatInterval > 0) {
+      this._heartbeatTimer = setInterval(() => this._heartbeatTick(), heartbeatInterval)
+    }
 
     this.peer = new Peer(peerId as string, peerOptions as never)
 
@@ -175,6 +195,23 @@ export class PeerjsProvider extends Observable<string> {
     this.peer.on('connection', (conn) => this._acceptIncoming(conn, 'incoming'))
     this.peer.on('disconnected', () => this.emit('status', [{ status: 'broker-disconnected' }]))
     this.peer.on('close', () => this.emit('status', [{ status: 'peer-closed' }]))
+
+    // PeerJS surfaces "peer id not registered with the broker" as a Peer error
+    // (type 'peer-unavailable'), not per-connection. Connect attempts to ids
+    // that no longer exist (tab closed, broker restart…) would otherwise hang
+    // until the connect() timeout — map them to a definitive failure now.
+    this._peerErrorHandler = (err: Error & { type?: string }): void => {
+      const match = /Could not connect to peer ([^ ]+)/.exec(err?.message ?? '')
+      const targetId = match?.[1]
+      const pending = targetId !== undefined ? this._pendingConnects.get(targetId) : undefined
+      if (pending !== undefined) {
+        this.connecting.delete(targetId!)
+        this._pendingConns.get(targetId!)?.close()
+        this._pendingConns.delete(targetId!)
+        this.emit('connection-failed', [err, targetId!])
+      }
+    }
+    this.peer.on('error', this._peerErrorHandler)
 
     this._docUpdateHandler = (update: Uint8Array, origin: unknown) => {
       // Updates we applied ourselves after receiving them from a peer are
@@ -231,9 +268,14 @@ export class PeerjsProvider extends Observable<string> {
   _destroyed: boolean
   _resyncInterval: ReturnType<typeof setInterval> | null
   _pendingConnects: Map<string, Promise<DataConnection>>
+  /** Outgoing DataConnections of in-flight connect() attempts, for cancellation. */
+  _pendingConns: Map<string, DataConnection>
+  _lastSeen: Map<string, number>
+  _heartbeatTimer: ReturnType<typeof setInterval> | null
   _docUpdateHandler: (update: Uint8Array, origin: unknown) => void
   _awarenessUpdateHandler: (changes: { added: number[], updated: number[], removed: number[] }, origin: unknown) => void
   _beforeUnloadHandler: () => void
+  _peerErrorHandler: (err: Error & { type?: string }) => void
 
   /**
    * Open a data connection to a specific peer id and start the Yjs sync
@@ -260,20 +302,32 @@ export class PeerjsProvider extends Observable<string> {
         reliable: true,
         metadata: { from: ownId }
       })
+      this._pendingConns.set(targetId, conn)
+      const cleanupPending = (): void => { this._pendingConns.delete(targetId) }
       return new Promise<DataConnection>((resolve, reject) => {
         const timer = setTimeout(() => {
-          this.connecting.delete(targetId)
+          // disconnect() may have canceled this attempt in the meantime —
+          // its `connecting.delete` is our cancellation flag.
+          if (!this.connecting.delete(targetId)) {
+            cleanupPending()
+            return
+          }
+          cleanupPending()
           conn.close()
-          reject(new Error(`timed out connecting to ${targetId}`))
+          const err = new Error(`timed out connecting to ${targetId}`)
+          this.emit('connection-failed', [err, targetId])
+          reject(err)
         }, this.connectionTimeout)
 
         conn.on('open', () => {
           clearTimeout(timer)
+          cleanupPending()
           resolve(conn)
         })
         conn.on('error', (err) => {
           clearTimeout(timer)
           this.connecting.delete(targetId)
+          cleanupPending()
           reject(err)
         })
         this._acceptIncoming(conn, 'outgoing')
@@ -286,8 +340,9 @@ export class PeerjsProvider extends Observable<string> {
   }
 
   /**
-   * Close the connection to a single peer, if any. Does not affect other
-   * connections.
+   * Close the connection to a single peer, if any. If called while a
+   * connect() attempt to this peer is still in flight, the attempt is
+   * canceled (no timeout error will fire afterwards).
    */
   disconnect (targetId: string): void {
     const state = this.connections.get(targetId)
@@ -297,12 +352,44 @@ export class PeerjsProvider extends Observable<string> {
       this.emit('peers', [{ added: [], removed: [targetId], webrtcPeers: this.connectedPeers, bcPeers: [] }])
       this.emit('status', [{ status: 'peer-disconnected', id: targetId }])
     }
-    this.connecting.delete(targetId)
+    if (this.connecting.delete(targetId)) {
+      // Canceled connect attempt: stop the underlying negotiation so it
+      // doesn't keep trying (or succeed later) behind our back.
+      this._pendingConns.get(targetId)?.close()
+      this._pendingConns.delete(targetId)
+    }
   }
 
   /** Close every current peer connection (the provider itself stays alive). */
   disconnectAll (): void {
     Array.from(this.connections.keys()).forEach((id) => this.disconnect(id))
+  }
+
+  /**
+   * Liveness: send a ping on every connection that has been silent for
+   * heartbeatInterval, and close connections that have been silent for
+   * heartbeatTimeout. Any inbound message (data, pong, sync reply) refreshes
+   * the peer's last-seen timestamp — see _handleMessage.
+   */
+  _heartbeatTick (): void {
+    if (this._destroyed) return
+    const now = Date.now()
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, messagePing)
+    const ping = encoding.toUint8Array(encoder)
+    this.connections.forEach(({ conn }, peerId) => {
+      if (!conn.open) return
+      const last = this._lastSeen.get(peerId) ?? now
+      const silentFor = now - last
+      if (silentFor >= this.heartbeatTimeout) {
+        // Half-open connection (crash, kill, network drop, tab closed without
+        // a clean close): the transport never told us. Close it ourselves —
+        // the normal 'close' path then removes the peer and notifies the UI.
+        conn.close()
+        return
+      }
+      if (silentFor >= this.heartbeatInterval) conn.send(ping)
+    })
   }
 
   /**
@@ -446,10 +533,24 @@ export class PeerjsProvider extends Observable<string> {
       conn.on('open', onOpen)
     }
 
-    conn.on('data', (data: unknown) => this._handleMessage(conn, peerId, data as Uint8Array | ArrayBuffer))
+    conn.on('data', (data: unknown) => {
+      this._lastSeen.set(peerId, Date.now())
+      this._handleMessage(conn, peerId, data as Uint8Array | ArrayBuffer)
+    })
+
+    // ICE 'failed' means the transport is beyond recovery (unlike
+    // 'disconnected', which usually self-heals after a Wi-Fi blip). Closing
+    // here gives much faster removal than waiting for the heartbeat timeout.
+    conn.on('iceStateChanged', (state: string) => {
+      if (state === 'failed') {
+        this._lastSeen.delete(peerId)
+        conn.close()
+      }
+    })
 
     conn.on('close', () => {
       this.connecting.delete(peerId)
+      this._lastSeen.delete(peerId)
       const wasConnected = this.connections.has(peerId) && this.connections.get(peerId)!.conn === conn
       if (wasConnected) {
         this.connections.delete(peerId)
@@ -471,6 +572,16 @@ export class PeerjsProvider extends Observable<string> {
       const messageType = decoding.readVarUint(decoder)
 
       switch (messageType) {
+        case messagePing: {
+          // Liveness probe — answer immediately so the sender's last-seen
+          // timestamp refreshes even when nothing else is flowing.
+          const pongEncoder = encoding.createEncoder()
+          encoding.writeVarUint(pongEncoder, messagePong)
+          conn.send(encoding.toUint8Array(pongEncoder))
+          break
+        }
+        case messagePong: // just traffic — the data handler already stamped last-seen
+          break
         case messageSync: {
           const syncMessageType = decoding.readVarUint(decoder)
           switch (syncMessageType) {
@@ -554,9 +665,11 @@ export class PeerjsProvider extends Observable<string> {
     this._destroyed = true
 
     if (this._resyncInterval) clearInterval(this._resyncInterval)
+    if (this._heartbeatTimer) clearInterval(this._heartbeatTimer)
 
     this.doc.off('update', this._docUpdateHandler)
     this.awareness.off('update', this._awarenessUpdateHandler)
+    this.peer.off('error', this._peerErrorHandler)
 
     if (typeof window !== 'undefined' && window.removeEventListener) {
       window.removeEventListener('beforeunload', this._beforeUnloadHandler)
