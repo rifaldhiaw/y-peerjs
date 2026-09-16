@@ -1,8 +1,7 @@
 import './style.css'
 import * as Y from 'yjs'
-import { PeerjsProvider, type PeersEvent, type StatusEvent } from '../lib/index.js'
+import { PeerjsProvider, TopologyTracker, type PeersEvent, type StatusEvent, type RemotePeerInfo } from '../lib/index.js'
 import { createTopologyWidget } from '../lib/widget/index.js'
-import { TopologyTracker, type RemotePeerInfo } from '../lib/widget/index.js'
 
 const log = (...args: unknown[]) => {
   const el = document.getElementById('log')!
@@ -45,11 +44,10 @@ const USERS = [
 const me = USERS[Math.floor(Math.random() * USERS.length)]
 provider.awareness.setLocalStateField('user', me)
 
-// Floating panel: live topology graph (directed edges) + connect/disconnect
-// controls. Press the ▸/▾ button in its header to collapse/expand it.
+// Floating panel: live topology graph + connect/disconnect controls.
 // The tracker discovers indirect peers (and their routes) via a small
-// path-vector protocol over the provider's message channel — every tab
-// needs one for the full topology to show up.
+// path-vector protocol on the provider's internal message channel — every
+// tab needs one for the full topology to show up.
 const tracker = new TopologyTracker(provider)
 const widget = createTopologyWidget({
   provider,

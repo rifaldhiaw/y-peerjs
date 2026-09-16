@@ -1,5 +1,33 @@
 import type { PeerjsProvider } from '../PeerjsProvider.js'
-import { TopologyTracker, type RemotePeerInfo } from './TopologyTracker.js'
+import { TopologyTracker, type RemotePeerInfo } from '../TopologyTracker.js'
+
+/** Sentinel peer id for "yourself" in the detail view (see `inspect`). */
+const SELF = '\u0000ypw-self'
+
+/**
+ * Escape a string for safe interpolation into HTML text content and
+ * double-quoted attributes. Applied to EVERY peer-derived string (names,
+ * ids, failure messages…): awareness state is written by other peers, so
+ * without this any participant could inject script into every
+ * collaborator's tab.
+ */
+function esc (s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+/**
+ * Validate a peer-supplied color before it goes into a CSS value —
+ * arbitrary strings would be a CSS-injection vector. Accepts #rgb, #rrggbb
+ * and #rrggbbaa; anything else falls back to the given default.
+ */
+function safeColor (color: unknown, fallback: string): string {
+  return typeof color === 'string' && /^#[0-9a-f]{3,8}$/i.test(color) ? color : fallback
+}
 
 /** How a peer is displayed on a node: initials avatar + optional full name. */
 export interface PeerAvatar {
@@ -139,7 +167,7 @@ export interface TopologyWidget {
   setCollapsed(collapsed: boolean): void
   /** The peer id currently shown in the detail view, or null (list view). */
   getInspected(): string | null
-  /** Show a peer's detail view ('self' for yourself), or null for the list. */
+  /** Show a peer's detail view (SELF sentinel for yourself), or null for the list. */
   inspect(peerId: string | null): void
   /** Remove the panel from the DOM and detach all listeners. */
   destroy(): void
@@ -242,7 +270,7 @@ export function createTopologyWidget ({
     recent.set(peerId, {
       peerId,
       name: av && av.name !== peerId ? av.name : undefined,
-      color: av?.color,
+      color: av !== undefined ? safeColor(av.color, fallbackColor) : undefined,
       lastSeen: Date.now()
     })
     while (recent.size > maxRecentPeers) {
@@ -253,7 +281,7 @@ export function createTopologyWidget ({
     }
   }
 
-  // Expire stale entries lazily on each snapshot — no timer needed.
+  // Expire stale entries lazily on provider events — no timer needed.
   function pruneRecent (): void {
     const now = Date.now()
     recent.forEach((info, peerId) => {
@@ -265,11 +293,30 @@ export function createTopologyWidget ({
     })
   }
 
+  /**
+   * Reconcile the recent/failure maps with live state. Called from provider
+   * event handlers (NOT from extractSnapshot — the snapshot getter must be
+   * side-effect free): peers that are live or connecting are not "recent".
+   */
+  function reconcileRecent (): void {
+    pruneRecent()
+    const live = (peerId: string): boolean => provider.connections.has(peerId) || provider.connecting.has(peerId)
+    recent.forEach((_, peerId) => {
+      if (live(peerId)) recent.delete(peerId)
+    })
+    lastFailure.forEach((_, peerId) => {
+      if (live(peerId)) lastFailure.delete(peerId)
+    })
+  }
+
   const shorten = (id: string): string =>
     id.length <= shortIdLength * 2 + 1 ? id : `${id.slice(0, shortIdLength)}…${id.slice(-shortIdLength)}`
 
   // --- awareness: map Yjs clientIDs to PeerJS ids -------------------------
-  const AWARENESS_PEER_ID_FIELD = 'peerId'
+  // Namespaced so it can't collide with application presence fields. The
+  // widget writes our own id here (and reads it from remote states) purely
+  // to know which awareness client "is" which PeerJS peer for avatars.
+  const AWARENESS_PEER_ID_FIELD = 'yPeerjsPeerId'
 
   function publishOwnPeerId (): void {
     const id = provider.id
@@ -301,7 +348,7 @@ export function createTopologyWidget ({
       found = {
         name,
         initials: initialsFor(name, peerId),
-        color: typeof user?.color === 'string' ? user.color : fallbackColor
+        color: safeColor(user?.color, fallbackColor)
       }
     })
     return found
@@ -570,10 +617,13 @@ export function createTopologyWidget ({
   })
 
   // --- topology snapshot --------------------------------------------------
+  // Connection status, tracked via the provider's 'status' events (the
+  // snapshot getter reads this instead of reaching into provider.peer).
+  let currentStatus = 'idle'
   let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], peers: [], selfAvatar: null, avatars: new Map(), recent: [] }
 
+  /** Pure snapshot of current state — no side effects. */
   function extractSnapshot (): TopologySnapshot {
-    pruneRecent()
     const peers: GraphPeer[] = []
     const avatars = new Map<string, PeerAvatar>()
     provider.connections.forEach(({ synced }, peerId) => {
@@ -586,20 +636,10 @@ export function createTopologyWidget ({
       const av = avatarFor(peerId)
       if (av) avatars.set(peerId, av)
     })
-    // Anything live or connecting is not "recent" — covers both directions
-    // of churn (we connected to them / they connected to us).
-    peers.forEach((p) => {
-      recent.delete(p.peerId)
-      lastFailure.delete(p.peerId)
-    })
-    provider.connecting.forEach((peerId) => {
-      recent.delete(peerId)
-      lastFailure.delete(peerId)
-    })
     const recentPeers = [...recent.values()].sort((a, b) => b.lastSeen - a.lastSeen)
     return {
       selfId: provider.id ?? null,
-      status: provider.peer.open ? 'peer-open' : 'idle',
+      status: currentStatus,
       connecting: Array.from(provider.connecting),
       peers,
       selfAvatar: avatarFor(provider.id ?? '') ?? null,
@@ -610,8 +650,8 @@ export function createTopologyWidget ({
 
   // --- avatar chip --------------------------------------------------------
   function avatarChip (av: PeerAvatar | undefined, fallbackId: string, size: number): string {
-    const color = av?.color ?? fallbackColor
-    const text = av?.initials ?? fallbackId.slice(0, 2).toUpperCase()
+    const color = av !== undefined ? safeColor(av.color, fallbackColor) : fallbackColor
+    const text = esc(av?.initials ?? fallbackId.slice(0, 2).toUpperCase())
     const fs = Math.round(size * 0.42)
     return `<span style="display:inline-flex;width:${size}px;height:${size}px;border-radius:50%;background:${color};color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:${fs}px;flex-shrink:0">${text}</span>`
   }
@@ -640,12 +680,12 @@ export function createTopologyWidget ({
       const statusIcon = p.kind === 'direct'
         ? (p.synced ? `<span style="color:#a6e3a1">${icon('check', 11)}</span>` : `<span style="color:#f9e2af">${icon('clock', 11)}</span>`)
         : `<span style="opacity:.6">${icon('route', 11)}</span>`
-      const via = p.kind === 'indirect' ? `<span style="opacity:.55;font-size:10px">via ${displayNameFor(p.path![0])}</span>` : ''
+      const via = p.kind === 'indirect' ? `<span style="opacity:.55;font-size:10px">via ${esc(displayNameFor(p.path![0]))}</span>` : ''
       return `
-        <div class="ypw-row${selected}" data-peer="${p.peerId}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer">
+        <div class="ypw-row${selected}" data-peer="${esc(p.peerId)}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer">
           ${statusIcon}
           ${avatarChip(av, p.peerId, 22)}
-          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av && av.name !== p.peerId ? `<strong>${av.name}</strong> <span style="opacity:.55;font-size:10.5px">${shorten(p.peerId)}</span>` : shorten(p.peerId)}</span>
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av && av.name !== p.peerId ? `<strong>${esc(av.name)}</strong> <span style="opacity:.55;font-size:10.5px">${esc(shorten(p.peerId))}</span>` : esc(shorten(p.peerId))}</span>
           ${via}
           <button class="ypw-row-action" title="${p.kind === 'direct' ? 'disconnect' : 'connect'}" style="cursor:pointer;background:none;border:none;color:${p.kind === 'direct' ? '#f38ba8' : '#a6e3a1'};padding:2px;display:inline-flex">${icon(p.kind === 'direct' ? 'scissors' : 'plug', 12)}</button>
         </div>
@@ -656,7 +696,7 @@ export function createTopologyWidget ({
       <div class="ypw-row" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;opacity:.6">
         <span style="color:#f9e2af">${icon('clock', 11)}</span>
         ${avatarChip(undefined, peerId, 22)}
-        <span style="flex:1">${shorten(peerId)}</span>
+        <span style="flex:1">${esc(shorten(peerId))}</span>
         <span style="font-size:10.5px">connecting…</span>
         <button class="ypw-row-cancel" title="cancel connect" style="cursor:pointer;background:none;border:none;color:#f38ba8;padding:2px;display:inline-flex">${icon('x', 12)}</button>
       </div>
@@ -664,13 +704,13 @@ export function createTopologyWidget ({
 
     const recentRows = snapshot.recent.map((r) => {
       const failure = lastFailure.get(r.peerId)
-      const chip = `<span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:${r.color ?? fallbackColor};opacity:.45;color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:9px;flex-shrink:0">${r.name ? r.name.slice(0, 2).toUpperCase() : r.peerId.slice(0, 2).toUpperCase()}</span>`
-      const label = r.name ? `<strong style="opacity:.75">${r.name}</strong> <span style="opacity:.45;font-size:10.5px">${shorten(r.peerId)}</span>` : `<span style="opacity:.75">${shorten(r.peerId)}</span>`
+      const chip = `<span style="display:inline-flex;width:22px;height:22px;border-radius:50%;background:${r.color !== undefined ? safeColor(r.color, fallbackColor) : fallbackColor};opacity:.45;color:#1e1e2e;align-items:center;justify-content:center;font-weight:bold;font-size:9px;flex-shrink:0">${esc(r.name ? r.name.slice(0, 2).toUpperCase() : r.peerId.slice(0, 2).toUpperCase())}</span>`
+      const label = r.name ? `<strong style="opacity:.75">${esc(r.name)}</strong> <span style="opacity:.45;font-size:10.5px">${esc(shorten(r.peerId))}</span>` : `<span style="opacity:.75">${esc(shorten(r.peerId))}</span>`
       const meta = failure
-        ? `<span style="color:#f38ba8;font-size:10px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${failure}">${failure}</span>`
+        ? `<span style="color:#f38ba8;font-size:10px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(failure)}">${esc(failure)}</span>`
         : `<span style="opacity:.45;font-size:10px">${Math.round((Date.now() - r.lastSeen) / 1000)}s ago</span>`
       return `
-        <div class="ypw-row ypw-row-recent" data-peer="${r.peerId}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer;opacity:.85">
+        <div class="ypw-row ypw-row-recent" data-peer="${esc(r.peerId)}" style="display:flex;align-items:center;gap:8px;padding:6px 6px;border-radius:8px;cursor:pointer;opacity:.85">
           <span style="opacity:.5">${icon('clock', 11)}</span>
           ${chip}
           <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${label}</span>
@@ -710,7 +750,7 @@ export function createTopologyWidget ({
   // --- right panel: detail view ------------------------------------------
   function renderDetail (): void {
     const peerId = inspected!
-    const isSelf = peerId === 'self' || peerId === snapshot.selfId
+    const isSelf = peerId === SELF || peerId === snapshot.selfId
     const direct = snapshot.peers.find((p) => p.peerId === peerId && p.kind === 'direct')
     const indirect = snapshot.peers.find((p) => p.peerId === peerId && p.kind === 'indirect')
     const connecting = snapshot.connecting.includes(peerId)
@@ -734,25 +774,25 @@ export function createTopologyWidget ({
       <div style="display:flex;align-items:center;gap:10px;padding:8px 4px 2px">
         ${avatarChip(av ?? undefined, fullId, 40)}
         <div style="min-width:0">
-          <div style="font-weight:bold;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${av.color};margin-right:5px;vertical-align:1px"></span>${av.name}` : name}</div>
-          ${av ? `<div style="opacity:.55;font-size:10.5px">${shorten(fullId)}</div>` : ''}
+          <div style="font-weight:bold;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${av ? `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${safeColor(av.color, fallbackColor)};margin-right:5px;vertical-align:1px"></span>${esc(av.name)}` : esc(name)}</div>
+          ${av ? `<div style="opacity:.55;font-size:10.5px">${esc(shorten(fullId))}</div>` : ''}
         </div>
       </div>
       <div style="border-top:1px solid #313244;margin:8px 0"></div>
     `
 
     // Identity rows.
-    const idRow = `<span style="display:inline-flex;align-items:center;gap:6px;min-width:0"><span style="word-break:break-all">${fullId}</span><button class="ypw-copy ypw-btn" title="copy full id" style="cursor:pointer;background:none;border:none;color:#89b4fa;padding:2px;display:inline-flex">${icon('copy', 12)}</button></span>`
+    const idRow = `<span style="display:inline-flex;align-items:center;gap:6px;min-width:0"><span style="word-break:break-all">${esc(fullId)}</span><button class="ypw-copy ypw-btn" title="copy full id" style="cursor:pointer;background:none;border:none;color:#89b4fa;padding:2px;display:inline-flex">${icon('copy', 12)}</button></span>`
     if (isSelf) {
       body += row('user', 'role', 'you (this browser)')
       body += row('hash', 'id', idRow)
-      body += row('globe', 'status', snapshot.status)
+      body += row('globe', 'status', esc(snapshot.status))
       // Editable name/color -> written to awareness so all peers see it.
       body += `
         <div style="display:flex;gap:8px;align-items:center;margin:8px 0">
           <span style="width:14px;flex-shrink:0;opacity:.6;display:inline-flex">${icon('user', 12)}</span>
-          <input class="ypw-edit-name ypw-input" value="${av?.name ?? ''}" placeholder="your name" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:4px 8px;outline:none" />
-          <input class="ypw-edit-color" type="color" value="${av?.color ?? fallbackColor}" title="your color" style="width:30px;height:26px;border:1px solid #45475a;border-radius:8px;background:#313244;cursor:pointer;padding:2px" />
+          <input class="ypw-edit-name ypw-input" value="${esc(av?.name ?? '')}" placeholder="your name" style="flex:1;min-width:0;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:4px 8px;outline:none" />
+          <input class="ypw-edit-color" type="color" value="${safeColor(av?.color, fallbackColor)}" title="your color" style="width:30px;height:26px;border:1px solid #45475a;border-radius:8px;background:#313244;cursor:pointer;padding:2px" />
         </div>
       `
     } else {
@@ -763,7 +803,7 @@ export function createTopologyWidget ({
         body += row('globe', 'status', '1 hop away')
       } else if (indirect) {
         body += row('user', 'role', 'indirect · not directly connected')
-        const route = [...indirect.path!, peerId].join(' → ')
+        const route = [...indirect.path!, peerId].map((hop) => esc(displayNameFor(hop))).join(' → ')
         body += row('route', 'route', route)
         const hops = (indirect.path?.length ?? 0) + 1
         body += row('globe', 'status', `${hops} hop${hops === 1 ? '' : 's'} away`)
@@ -773,7 +813,7 @@ export function createTopologyWidget ({
         const recentInfo = snapshot.recent.find((r) => r.peerId === peerId)
         const failure = lastFailure.get(peerId)
         body += row('user', 'role', recentInfo ? 'recent · offline / unreachable' : 'unknown peer')
-        if (failure) body += row('x', 'last try', `<span style="color:#f38ba8">${failure}</span>`)
+        if (failure) body += row('x', 'last try', `<span style="color:#f38ba8">${esc(failure)}</span>`)
         else body += row('globe', 'status', 'not in mesh — connect to reach it')
       }
     }
@@ -867,7 +907,7 @@ export function createTopologyWidget ({
     provider.awareness.getStates().forEach((state, clientId) => {
       const s = state as Record<string, unknown>
       const user = s.user as { name?: unknown, color?: unknown } | undefined
-      parts.push(`${clientId}:${String(s.peerId)}:${String(user?.name)}:${String(user?.color)}`)
+      parts.push(`${clientId}:${String(s[AWARENESS_PEER_ID_FIELD])}:${String(user?.name)}:${String(user?.color)}`)
     })
     return parts.sort().join('|')
   }
@@ -882,9 +922,9 @@ export function createTopologyWidget ({
     // Header self chip.
     const selfAv = snapshot.selfAvatar
     selfChip.innerHTML = selfAv
-      ? `${avatarChip(selfAv, snapshot.selfId ?? '', 18)} <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${selfAv.name}</span><span style="opacity:.5;font-size:10px">${shorten(snapshot.selfId ?? '')}</span>`
-      : `<span style="opacity:.6;font-size:10.5px">${snapshot.selfId ? shorten(snapshot.selfId) : 'connecting…'}</span>`
-    selfChip.onclick = () => widgetApi.inspect(inspected === 'self' ? null : 'self')
+      ? `${avatarChip(selfAv, snapshot.selfId ?? '', 18)} <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(selfAv.name)}</span><span style="opacity:.5;font-size:10px">${esc(shorten(snapshot.selfId ?? ''))}</span>`
+      : `<span style="opacity:.6;font-size:10.5px">${snapshot.selfId ? esc(shorten(snapshot.selfId)) : 'connecting…'}</span>`
+    selfChip.onclick = () => widgetApi.inspect(inspected === SELF ? null : SELF)
 
     // Launcher badge: peer count when the panel is closed.
     const nPeers = snapshot.peers.length + snapshot.connecting.length
@@ -957,7 +997,7 @@ export function createTopologyWidget ({
      */
     const routeEdges = new Set<string>() // "from>to" pairs on the inspected route
     let routeDest: string | null = null
-    if (inspected && inspected !== 'self') {
+    if (inspected && inspected !== SELF) {
       const indirect = snapshot.peers.find((p) => p.peerId === inspected && p.kind === 'indirect')
       if (indirect) {
         routeDest = inspected
@@ -1001,7 +1041,7 @@ export function createTopologyWidget ({
       edge.setAttribute('x2', String(x2))
       edge.setAttribute('y2', String(y2))
       const visible = onRoute(p)
-      const highlight = inspected === p.peerId || inspected === 'self' || (routeDest !== null && visible)
+      const highlight = inspected === p.peerId || inspected === SELF || (routeDest !== null && visible)
       edge.setAttribute('stroke', p.kind === 'direct' ? (p.synced ? '#a6e3a1' : '#f9e2af') : (routeDest !== null && visible ? '#89b4fa' : '#6c7086'))
       edge.setAttribute('stroke-width', highlight ? '2.5' : '1.5')
       edge.setAttribute('opacity', routeDest !== null && !visible ? '0.15' : inspected && !highlight ? '0.35' : '1')
@@ -1138,8 +1178,8 @@ export function createTopologyWidget ({
       const status = p.kind === 'direct'
         ? (p.synced ? 'direct · synced' : 'direct · syncing…')
         : `indirect · via ${displayNameFor(p.path![0])}`
-      const who = name ? `${name} <span style="opacity:.6">${shorten(p.peerId)}</span>` : shorten(p.peerId)
-      return `<div>${who}</div><div style="opacity:.7">${status}</div>`
+      const who = name ? `${esc(name)} <span style="opacity:.6">${esc(shorten(p.peerId))}</span>` : esc(shorten(p.peerId))
+      return `<div>${who}</div><div style="opacity:.7">${esc(status)}</div>`
     }
 
     indirects.forEach((p) => {
@@ -1153,7 +1193,7 @@ export function createTopologyWidget ({
     })
     snapshot.connecting.forEach((peerId) => {
       const pos = positions.get(peerId)!
-      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, tooltip: `${shorten(peerId)} · connecting…`, cursor: 'wait' })
+      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, tooltip: `${esc(shorten(peerId))} · connecting…`, cursor: 'wait' })
     })
     directs.forEach((p) => {
       const pos = positions.get(p.peerId)!
@@ -1165,9 +1205,9 @@ export function createTopologyWidget ({
       })
     })
     const selfTooltip = selfAv
-      ? `<div>${selfAv.name} <span style="opacity:.6">${shorten(snapshot.selfId ?? '')}</span></div><div style="opacity:.7">you · ${provider.connections.size} direct · ${snapshot.peers.filter((p) => p.kind === 'indirect').length} indirect</div>`
+      ? `<div>${esc(selfAv.name)} <span style="opacity:.6">${esc(shorten(snapshot.selfId ?? ''))}</span></div><div style="opacity:.7">you · ${provider.connections.size} direct · ${snapshot.peers.filter((p) => p.kind === 'indirect').length} indirect</div>`
       : '<div>you · connecting…</div>'
-    nodeFor(snapshot.selfId ?? 'self', { x: cx, y: cy }, {
+    nodeFor(snapshot.selfId ?? SELF, { x: cx, y: cy }, {
       color: selfAv?.color ?? '#89b4fa',
       r: 14,
       tooltip: selfTooltip
@@ -1221,10 +1261,19 @@ export function createTopologyWidget ({
   const events = ['peers', 'status', 'synced', 'connection-error'] as const
   events.forEach((name) => provider.on(name, render as () => void))
 
+  // Track connection status from events (instead of reading provider.peer
+  // directly) and keep the recent list reconciled with live state.
+  const onStatusEvent = ({ status }: { status: string }): void => {
+    currentStatus = status
+    reconcileRecent()
+  }
+  provider.on('status', onStatusEvent)
+
   // Remember peers the moment they leave the mesh (either direction) so they
   // show up in the list's "recent" section for quick reconnecting.
   const onPeersEvent = ({ removed }: { added: string[], removed: string[] }): void => {
     removed.forEach((peerId) => rememberPeer(peerId))
+    reconcileRecent()
   }
   provider.on('peers', onPeersEvent)
   // Surface connect failures concretely: 'connection-failed' is the definitive
@@ -1264,6 +1313,7 @@ export function createTopologyWidget ({
     },
     destroy () {
       events.forEach((name) => provider.off(name, render as (...args: unknown[]) => void))
+      provider.off('status', onStatusEvent)
       provider.off('peers', onPeersEvent)
       provider.off('connection-failed', onConnectionFailed as (...args: unknown[]) => void)
       tracker.off('changed', onTrackerChanged)

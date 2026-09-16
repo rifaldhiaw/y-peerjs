@@ -14,6 +14,13 @@ const messageQueryAwareness = 2
 const messageCustom = 3
 const messagePing = 4
 const messagePong = 5
+/**
+ * Internal extension channel: opaque payloads carried hop-to-hop for
+ * provider add-ons (e.g. TopologyTracker). Never surfaced to application
+ * code and never relayed by the provider itself — an add-on decides whether
+ * to forward what it receives. See {@link sendInternal} / `internalMessage`.
+ */
+const messageInternal = 6
 
 // Peer error types that mean the provider can never become ready — anything
 // else ('peer-unavailable', 'network', 'disconnected', …) is transient and
@@ -137,6 +144,7 @@ export interface StatusEvent {
  *  - 'connection-failed' [error, peerId]                        a connect() attempt definitively failed (peer not registered with the broker, or timed out) — the widget uses this to stop showing 'connecting…'
  *  - 'message-error'     [error, peerId]                        malformed/unhandled message from a peer
  *  - 'message'           [{ peerId, data }]                     raw custom messages sent via provider.send()
+ *  - 'internal-message'  [{ peerId, data }]                     opaque payloads from provider add-ons (sendInternal); apps can ignore these
  * @extends {Observable<string>}
  *
  * Note: the provider deliberately knows nothing about the wider network
@@ -507,6 +515,25 @@ export class PeerjsProvider extends Observable<string> {
     this.connections.forEach((_, id) => this.send(id, data))
   }
 
+  /**
+   * Send an opaque add-on payload to one specific connected peer on the
+   * internal extension channel. Unlike {@link send}, these payloads never
+   * reach the application 'message' event — they are surfaced only via the
+   * 'internal-message' event, which is how provider add-ons (e.g. the
+   * TopologyTracker) communicate without polluting the app's channel.
+   * @returns whether the message was sent (false if not connected)
+   */
+  sendInternal (targetId: string, data: Uint8Array | string): boolean {
+    const state = this.connections.get(targetId)
+    if (!state || !state.conn.open) return false
+    const payload = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data))
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, messageInternal)
+    encoding.writeVarUint8Array(encoder, payload)
+    state.conn.send(encoding.toUint8Array(encoder))
+    return true
+  }
+
   _broadcast (data: Uint8Array): void {
     this.connections.forEach(({ conn }) => {
       if (conn.open) conn.send(data)
@@ -789,6 +816,11 @@ export class PeerjsProvider extends Observable<string> {
         case messageCustom: {
           const payload = decoding.readVarUint8Array(decoder)
           this.emit('message', [{ peerId, data: payload }])
+          break
+        }
+        case messageInternal: {
+          const payload = decoding.readVarUint8Array(decoder)
+          this.emit('internal-message', [{ peerId, data: payload }])
           break
         }
         default:

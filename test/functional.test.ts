@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import * as Y from 'yjs'
-import { PeerjsProvider } from '../src/lib/index.js'
-import { TopologyTracker } from '../src/lib/widget/TopologyTracker.js'
+import { PeerjsProvider, TopologyTracker } from '../src/lib/index.js'
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -353,6 +352,13 @@ describe('PeerjsProvider', () => {
     await waitForEvent(providerA, 'synced', ({ peerId }) => peerId === 'tlk-b')
     await wait(150) // let tracker announcements flow
 
+    // Tracker announcements travel on the internal channel — the app-level
+    // 'message' event must never see one.
+    let sawTrackerTraffic = false
+    providerB.on('message', ({ data }: { data: Uint8Array }) => {
+      if (new TextDecoder().decode(data).startsWith('y-peerjs-topo')) sawTrackerTraffic = true
+    })
+
     // App-level message still arrives intact despite tracker traffic.
     const gotMessage = waitForEvent(providerB, 'message', ({ peerId }) => peerId === 'tlk-a')
     providerA.send('tlk-b', 'ping')
@@ -363,6 +369,11 @@ describe('PeerjsProvider', () => {
     // tracker-prefixed string, is ignored by the tracker.
     expect(trackerA.getPath('tlk-b')).toBeUndefined() // direct, not indirect
     expect(trackerB.getRemotePeers()).toEqual([])
+    expect(sawTrackerTraffic).toBe(false) // internal channel, not app channel
+
+    // nextHop(): for a direct peer there is no relay hop; for an indirect
+    // one it is the first path element.
+    expect(trackerA.nextHop('tlk-b')).toBeUndefined()
 
     trackerA.destroy()
     trackerB.destroy()

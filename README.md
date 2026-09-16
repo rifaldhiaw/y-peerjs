@@ -84,6 +84,10 @@ it only sees its direct connections and relays blindly. If you want to
 *discover and visualize* the reachable topology (indirect peers and the
 exact route to them), attach the opt-in `TopologyTracker` (see below).
 
+Tracker announcements travel on a provider-internal message channel —
+they never appear on the application `'message'` event and cannot collide
+with your own `send()` payloads.
+
 ## API
 
 ### `new PeerjsProvider(doc, options?)`
@@ -124,6 +128,12 @@ exact route to them), attach the opt-in `TopologyTracker` (see below).
 - **`provider.broadcast(data): void`** — same as `send`, to every
   connected peer.
 
+- **`provider.sendInternal(targetId, data): boolean`** — send an opaque
+  payload on the internal extension channel (surfaced via the
+  `'internal-message'` event, never on `'message'`). Used by provider
+  add-ons such as `TopologyTracker`; application code normally has no
+  reason to touch this.
+
 - **`provider.queryAwareness(): void`** — ask all connected peers to
   resend their current awareness state (handy right after you `connect()`
   to a peer that joined earlier via someone else).
@@ -133,16 +143,16 @@ exact route to them), attach the opt-in `TopologyTracker` (see below).
 
 ### `new TopologyTracker(provider, options?)` — opt-in topology discovery
 
-An `Observable`-based helper (from `y-peerjs/widget`) that runs a small
-path-vector discovery protocol over the provider's generic
-`send()`/`'message'` channel, so every participant learns the full
-reachable topology — which direct connection leads to any indirect peer,
-and the exact intermediate hops. The provider core stays clean; attach a
-tracker only if you need remote-peer visibility (the topology widget
-does, and creates one automatically).
+An `Observable`-based helper (exported from the package root, `'y-peerjs'`)
+that runs a small path-vector discovery protocol over the provider's
+*internal* message channel, so every participant learns the full reachable
+topology — which direct connection leads to any indirect peer, and the
+exact intermediate hops. The provider core stays clean; attach a tracker
+only if you need remote-peer visibility (the topology widget does, and
+creates one automatically).
 
 ```js
-import { TopologyTracker } from 'y-peerjs/widget'
+import { TopologyTracker } from 'y-peerjs'
 
 const tracker = new TopologyTracker(provider)
 tracker.on('changed', (remotePeers) => {
@@ -150,15 +160,16 @@ tracker.on('changed', (remotePeers) => {
   console.log('indirect peers:', remotePeers)
 })
 tracker.getPath('some-remote-peer-id') // e.g. ['hub', 'bridge'] or undefined
+tracker.nextHop('some-remote-peer-id') // e.g. 'hub' — where to send via
 
 // ...later:
 tracker.destroy()
 ```
 
-Both ends need a tracker for discovery to work. Tracker messages share
-the custom-message channel with your own `provider.send()` payloads; they
-are tagged with a `y-peerjs-topo1:` wire prefix, so avoid starting your
-own string messages with that prefix.
+Both ends need a tracker for discovery to work. Tracker traffic uses the
+provider's internal extension channel (`sendInternal` / `'internal-message'`)
+and is invisible to application `'message'` handlers. It is still exported
+from `'y-peerjs/widget'` for backwards compatibility.
 
 ### Properties
 
@@ -182,6 +193,7 @@ own string messages with that prefix.
 | `connection-failed` | `[Error, peerId]` | a `connect()` attempt definitively failed — the peer id is not registered with the broker (`peer-unavailable`) or the attempt timed out |
 | `message-error` | `[Error, peerId]` | malformed/unrecognized message from a peer |
 | `message` | `[{ peerId, data }]` | custom payload received via the peer's `send`/`broadcast` |
+| `internal-message` | `[{ peerId, data }]` | payload from provider add-ons (e.g. the topology tracker); apps can ignore these |
 
 ## How it differs from y-webrtc
 
@@ -231,7 +243,8 @@ const provider = new PeerjsProvider(doc, { peerId: 'my-peer-id' })
 await provider.whenReady
 
 // Optional: pass your own tracker to share discovery state with your app.
-// Omit it and the widget creates (and destroys) one for you.
+// Omit it and the widget creates (and destroys) one for you. TopologyTracker
+// is exported from the package root; the widget re-exports it for compat.
 const tracker = new TopologyTracker(provider)
 
 // Floating panel showing the live connection graph,

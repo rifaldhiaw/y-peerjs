@@ -1,15 +1,14 @@
 import { Observable } from 'lib0/observable'
-import type { PeerjsProvider } from '../PeerjsProvider.js'
+import type { PeerjsProvider } from './PeerjsProvider.js'
 
 /**
- * Wire prefix for topology messages. All tracker traffic is a JSON string
- * tagged with this prefix, sent over the provider's generic custom-message
- * channel (`provider.send` / the `'message'` event). The provider treats
- * custom messages as application payloads — it never relays them — which is
- * exactly what routing advertisements want: they only travel one hop, and
- * each receiver recomputes and re-announces to its own neighbors.
+ * Wire tag for topology announcements carried on the provider's internal
+ * extension channel (`sendInternal` / the 'internal-message' event). The
+ * version suffix lets the protocol evolve without old peers mis-parsing
+ * new payloads. Applications never see this traffic, so the tag only
+ * guards against cross-version confusion, not app-message collisions.
  */
-const WIRE_PREFIX = 'y-peerjs-topo1:'
+const WIRE_TAG = 'y-peerjs-topo2:'
 
 /**
  * How often each peer re-announces its routing table (ms). Changes also
@@ -41,7 +40,7 @@ interface PeersEventLike {
   removed: string[]
 }
 
-interface MessageEventLike {
+interface InternalMessageEventLike {
   peerId: string
   data: Uint8Array
 }
@@ -53,9 +52,10 @@ interface MessageEventLike {
  * sync correctness comes purely from relaying + dedup, which works over any
  * connection graph. This tracker layers *visibility* on top: it runs a
  * small path-vector routing protocol (BGP-style) over the provider's
- * generic custom-message channel so every participant learns the full
- * reachable topology — which direct connection leads to any indirect peer,
- * and the exact intermediate hops.
+ * internal extension channel (`sendInternal` / 'internal-message') so every
+ * participant learns the full reachable topology — which direct connection
+ * leads to any indirect peer, and the exact intermediate hops. Application
+ * messages (`send`/`broadcast`/'message') are completely untouched.
  *
  * How it works:
  *  - Each peer computes a routing view: direct connections contribute
@@ -68,6 +68,9 @@ interface MessageEventLike {
  *    can no longer reach.
  *  - Loops are impossible by construction: a route containing ourselves is
  *    dropped when it's learned.
+ *  - Retraction of a *dead* neighbor's routes relies on the provider
+ *    eventually reporting the connection as closed ('peers' removed) —
+ *    via the close event, ICE failure, or liveness timeout.
  *
  * Attach one to a provider (both ends need one for discovery to work):
  *
@@ -79,11 +82,6 @@ interface MessageEventLike {
  * Fires:
  *  - 'changed'  [RemotePeerInfo[]]  the set of known indirect peers (or any
  *    of their routes) changed
- *
- * Note: tracker messages share the custom-message channel with your app's
- * `provider.send()` payloads. They are tagged with a wire prefix that
- * ordinary app messages are unlikely to start with; if your app sends
- * strings, avoid the `y-peerjs-topo1:` prefix.
  */
 export class TopologyTracker extends Observable<string> {
   provider: PeerjsProvider
@@ -119,10 +117,10 @@ export class TopologyTracker extends Observable<string> {
         this._announce()
       }
     }
-    this._onMessage = ({ peerId, data }: MessageEventLike) => this._handleMessage(peerId, data)
+    this._onMessage = ({ peerId, data }: InternalMessageEventLike) => this._handleMessage(peerId, data)
 
     provider.on('peers', this._onPeers)
-    provider.on('message', this._onMessage)
+    provider.on('internal-message', this._onMessage)
 
     // Compute once our own id exists — covers trackers attached after
     // connections were already established.
@@ -136,7 +134,7 @@ export class TopologyTracker extends Observable<string> {
   }
 
   _onPeers: (event: PeersEventLike) => void
-  _onMessage: (event: MessageEventLike) => void
+  _onMessage: (event: InternalMessageEventLike) => void
 
   /**
    * Peers we are NOT directly connected to but know a route to, sorted by
@@ -159,6 +157,17 @@ export class TopologyTracker extends Observable<string> {
   getPath (peerId: string): string[] | undefined {
     const path = this._routes.get(peerId)
     return path !== undefined && path.length > 0 ? [...path] : undefined
+  }
+
+  /**
+   * The directly-connected peer to send traffic through in order to reach
+   * an indirect peer — the one thing every consumer actually needs. Returns
+   * undefined if the peer is unknown or directly connected (no relay
+   * needed: send to the peer itself).
+   */
+  nextHop (peerId: string): string | undefined {
+    const path = this._routes.get(peerId)
+    return path !== undefined && path.length > 0 ? path[0] : undefined
   }
 
   /**
@@ -217,7 +226,7 @@ export class TopologyTracker extends Observable<string> {
         if (path.length > 0 && path[0] === neighbor) return // split horizon
         entries.push([dest, path])
       })
-      this.provider.send(neighbor, WIRE_PREFIX + JSON.stringify(entries))
+      this.provider.sendInternal(neighbor, WIRE_TAG + JSON.stringify(entries))
     })
   }
 
@@ -231,14 +240,17 @@ export class TopologyTracker extends Observable<string> {
     if (!this.provider.connections.has(fromPeerId)) return
     let text: string
     try {
-      text = new TextDecoder().decode(data)
+      // fatal: invalid UTF-8 must throw so malformed payloads are ignored —
+      // a non-fatal decoder would silently substitute U+FFFD and could
+      // produce garbage route entries.
+      text = new TextDecoder('utf-8', { fatal: true }).decode(data)
     } catch {
       return
     }
-    if (!text.startsWith(WIRE_PREFIX)) return // not ours — leave it to the app
+    if (!text.startsWith(WIRE_TAG)) return // foreign version or junk — ignore
     let entries: unknown
     try {
-      entries = JSON.parse(text.slice(WIRE_PREFIX.length))
+      entries = JSON.parse(text.slice(WIRE_TAG.length))
     } catch {
       return // malformed — ignore
     }
@@ -276,7 +288,7 @@ export class TopologyTracker extends Observable<string> {
     this._destroyed = true
     clearInterval(this._announceInterval)
     this.provider.off('peers', this._onPeers)
-    this.provider.off('message', this._onMessage)
+    this.provider.off('internal-message', this._onMessage)
     super.destroy()
   }
 }
