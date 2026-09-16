@@ -224,6 +224,7 @@ export function createTopologyWidget ({
   }
 
   // --- DOM scaffold -------------------------------------------------------
+  const host: HTMLElement = container
   const root = document.createElement('div')
   root.className = 'ypw-root'
   root.style.cssText = [
@@ -278,6 +279,25 @@ export function createTopologyWidget ({
   const connectBtn = root.querySelector<HTMLButtonElement>('.ypw-connect')!
   const rightHead = root.querySelector<HTMLElement>('.ypw-right-head')!
   const rightBody = root.querySelector<HTMLElement>('.ypw-right-body')!
+
+  // --- hover tooltip (shared by all nodes, created once) ------------------
+  const tip = host.ownerDocument.createElement('div')
+  tip.className = 'ypw-tip'
+  tip.style.cssText = [
+    'position:fixed',
+    'display:none',
+    'pointer-events:none',
+    'z-index:2147483647',
+    'background:#11111bf5',
+    'border:1px solid #585b70',
+    'border-radius:8px',
+    'padding:5px 8px',
+    'font:10.5px/1.4 ui-monospace,monospace',
+    'color:#cdd6f4',
+    'white-space:nowrap',
+    'box-shadow:0 4px 16px #000a'
+  ].join(';')
+  host.ownerDocument.body.appendChild(tip)
 
   // --- collapsing ---------------------------------------------------------
   function applyCollapsed (): void {
@@ -599,8 +619,10 @@ export function createTopologyWidget ({
       svg.appendChild(edge)
     })
 
-    // Nodes.
-    const nodeFor = (peerId: string, pos: { x: number, y: number }, opts: { color: string, r: number, label: string, sub?: string, dashed?: boolean, cursor?: string }) => {
+    // Nodes: avatar circles only — no text labels, so the topology shape
+    // stays readable. Identity (name, id, status) appears on hover via the
+    // shared tooltip, and in full in the detail view on click.
+    const nodeFor = (peerId: string, pos: { x: number, y: number }, opts: { color: string, r: number, tooltip: string, dashed?: boolean, ring?: string, cursor?: string }) => {
       const g = document.createElementNS(ns, 'g')
       g.style.cursor = opts.cursor ?? 'pointer'
 
@@ -618,6 +640,9 @@ export function createTopologyWidget ({
       if (inspected === peerId) {
         circle.setAttribute('stroke', '#89b4fa')
         circle.setAttribute('stroke-width', '2.5')
+      } else if (opts.ring) {
+        circle.setAttribute('stroke', opts.ring)
+        circle.setAttribute('stroke-width', '2')
       }
       g.appendChild(circle)
 
@@ -635,25 +660,20 @@ export function createTopologyWidget ({
         g.appendChild(initials)
       }
 
-      const label = document.createElementNS(ns, 'text')
-      label.setAttribute('x', String(pos.x))
-      label.setAttribute('y', String(pos.y - opts.r - 6))
-      label.setAttribute('text-anchor', 'middle')
-      label.setAttribute('fill', inspected === peerId ? '#89b4fa' : '#cdd6f4')
-      label.setAttribute('font-size', '10')
-      label.textContent = opts.label
-      g.appendChild(label)
-
-      if (opts.sub) {
-        const sub = document.createElementNS(ns, 'text')
-        sub.setAttribute('x', String(pos.x))
-        sub.setAttribute('y', String(pos.y + opts.r + 13))
-        sub.setAttribute('text-anchor', 'middle')
-        sub.setAttribute('fill', '#6c7086')
-        sub.setAttribute('font-size', '8.5')
-        sub.textContent = opts.sub
-        g.appendChild(sub)
-      }
+      // Hover tooltip instead of permanent labels.
+      g.addEventListener('pointerenter', () => {
+        tip.innerHTML = opts.tooltip
+        tip.style.display = 'block'
+      })
+      g.addEventListener('pointermove', (e) => {
+        const x = e.clientX + 12
+        const y = e.clientY + 12
+        tip.style.left = Math.min(x, (host.ownerDocument.defaultView?.innerWidth ?? x) - 190) + 'px'
+        tip.style.top = y + 'px'
+      })
+      g.addEventListener('pointerleave', () => {
+        tip.style.display = 'none'
+      })
 
       g.addEventListener('click', (e) => {
         e.stopPropagation()
@@ -662,33 +682,45 @@ export function createTopologyWidget ({
       svg.appendChild(g)
     }
 
+    const tooltipFor = (p: GraphPeer): string => {
+      const av = snapshot.avatars.get(p.peerId)
+      const name = av && av.name !== p.peerId ? av.name : null
+      const status = p.kind === 'direct'
+        ? (p.synced ? 'direct · synced' : 'direct · syncing…')
+        : `indirect · via ${displayNameFor(p.via!)}`
+      const who = name ? `${name} <span style="opacity:.6">${shorten(p.peerId)}</span>` : shorten(p.peerId)
+      return `<div>${who}</div><div style="opacity:.7">${status}</div>`
+    }
+
     indirects.forEach((p) => {
       const pos = positions.get(p.peerId)!
       nodeFor(p.peerId, pos, {
         color: fallbackColor,
         r: 9,
-        label: displayNameFor(p.peerId),
-        sub: `via ${displayNameFor(p.via!)}`,
+        tooltip: tooltipFor(p),
         dashed: true
       })
     })
     snapshot.connecting.forEach((peerId) => {
       const pos = positions.get(peerId)!
-      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, label: shorten(peerId), sub: 'connecting…', cursor: 'wait' })
+      nodeFor(peerId, pos, { color: '#f9e2af', r: 8, tooltip: `${shorten(peerId)} · connecting…`, cursor: 'wait' })
     })
     directs.forEach((p) => {
       const pos = positions.get(p.peerId)!
       nodeFor(p.peerId, pos, {
         color: p.synced ? (snapshot.avatars.get(p.peerId)?.color ?? '#a6e3a1') : '#f9e2af',
         r: 12,
-        label: displayNameFor(p.peerId),
-        sub: p.synced ? undefined : 'syncing…'
+        tooltip: tooltipFor(p),
+        ring: p.synced ? undefined : '#f9e2af'
       })
     })
+    const selfTooltip = selfAv
+      ? `<div>${selfAv.name} <span style="opacity:.6">${shorten(snapshot.selfId ?? '')}</span></div><div style="opacity:.7">you · ${provider.connections.size} direct · ${provider.mesh.size} indirect</div>`
+      : '<div>you · connecting…</div>'
     nodeFor(snapshot.selfId ?? 'self', { x: cx, y: cy }, {
       color: selfAv?.color ?? '#89b4fa',
       r: 14,
-      label: selfAv ? selfAv.name : 'me'
+      tooltip: selfTooltip
     })
 
     svg.addEventListener('click', () => widgetApi.inspect(null))
@@ -730,6 +762,7 @@ export function createTopologyWidget ({
     destroy () {
       events.forEach((name) => provider.off(name, render as (...args: unknown[]) => void))
       provider.awareness.off('update', render as (...args: unknown[]) => void)
+      tip.remove()
       root.remove()
     }
   }
