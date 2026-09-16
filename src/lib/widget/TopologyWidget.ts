@@ -1,5 +1,15 @@
 import type { PeerjsProvider } from '../PeerjsProvider.js'
 
+/** How a peer is displayed on a node: initials avatar + optional full name. */
+export interface PeerAvatar {
+  /** Display name, from awareness state `user.name` if present. */
+  name: string
+  /** Two-letter initials derived from the name (or 'PE' fallback for peer id). */
+  initials: string
+  /** Node fill color, from awareness state `user.color` if present. */
+  color: string
+}
+
 /**
  * Snapshot of the connection topology, derived from the provider's public
  * state. `links` is one entry per open connection, with the direction in
@@ -15,6 +25,10 @@ export interface TopologySnapshot {
   connecting: string[]
   /** One entry per open peer connection. */
   links: Array<{ peerId: string, direction: 'outgoing' | 'incoming', synced: boolean }>
+  /** Avatar for ourselves, if we have a local awareness state. */
+  selfAvatar: PeerAvatar | null
+  /** Avatars for connected peers, keyed by peer id (empty when unknown). */
+  avatars: Map<string, PeerAvatar>
 }
 
 export interface TopologyWidgetOptions {
@@ -28,6 +42,11 @@ export interface TopologyWidgetOptions {
   startCollapsed?: boolean
   /** Called with the new collapsed state whenever the panel is collapsed/expanded. */
   onToggleCollapsed?: (collapsed: boolean) => void
+  /**
+   * Fallback color for nodes/avatars when a peer has no `user.color` in
+   * awareness. Default '#a6e3a1'.
+   */
+  fallbackColor?: string
 }
 
 /**
@@ -39,12 +58,15 @@ export interface TopologyWidgetOptions {
  *  - a render loop fed by the provider's 'peers'/'status'/'synced' events
  *  - directed edges: arrows point from the initiator of the connection to
  *    the peer that accepted it (outgoing = we called connect())
+ *  - awareness avatars: initials overlaid on each node, derived from the
+ *    standard `user` awareness field (`{ name, color }`). Remote avatars
+ *    are matched to nodes via a `peerId` field the widget injects into the
+ *    local awareness state and reads back from remote states.
  *  - draggable header with a collapse/expand toggle; when collapsed only
  *    the title bar remains (dragging still works)
  *  - connect (via input + button) and per-peer disconnect controls
  *
  * TODO future features:
- *  - awareness avatars/cursors overlaid on each node
  *  - theming, touch dragging
  */
 export interface TopologyWidget {
@@ -65,11 +87,65 @@ export function createTopologyWidget ({
   container = typeof document !== 'undefined' ? document.body : undefined,
   position = { x: 16, y: 16 },
   startCollapsed = false,
-  onToggleCollapsed
+  onToggleCollapsed,
+  fallbackColor = '#a6e3a1'
 }: TopologyWidgetOptions): TopologyWidget {
   if (!container) throw new Error('TopologyWidget requires a DOM container')
 
   let collapsed = startCollapsed
+
+  // --- awareness: map Yjs clientIDs to PeerJS ids -------------------------
+  // Awareness states are keyed by Yjs clientID, which has no inherent
+  // relation to PeerJS peer ids. To match remote avatars to graph nodes we
+  // publish our own peer id inside our awareness state under a dedicated
+  // field, and read that same field back from remote states.
+  const AWARENESS_PEER_ID_FIELD = 'peerId'
+
+  function publishOwnPeerId (): void {
+    const id = provider.id
+    if (!id) return
+    const local = provider.awareness.getLocalState()
+    if (local?.[AWARENESS_PEER_ID_FIELD] === id) return
+    // Merge (not overwrite) so a concurrently-set `user` field survives.
+    provider.awareness.setLocalStateField(AWARENESS_PEER_ID_FIELD, id)
+  }
+
+  // Publish whenever our peer id becomes known or changes, and once the
+  // first connection opens (so the avatar payload propagates).
+  provider.on('status', () => publishOwnPeerId())
+  provider.on('peers', () => publishOwnPeerId())
+  provider.whenReady.then(publishOwnPeerId).catch(() => {})
+
+  function initialsFor (name: string, peerId: string): string {
+    const trimmed = name.trim()
+    if (trimmed.length === 0) return peerId.slice(0, 2).toUpperCase()
+    const words = trimmed.split(/\s+/)
+    if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase()
+    return trimmed.slice(0, 2).toUpperCase()
+  }
+
+  /**
+   * Build peerId -> avatar from current awareness states, using the
+   * `peerId` field each widget publishes. Falls back to initials derived
+   * from the peer id itself when no user info is present.
+   */
+  function extractAvatars (): { selfAvatar: PeerAvatar | null, avatars: Map<string, PeerAvatar> } {
+    const avatars = new Map<string, PeerAvatar>()
+    const states = provider.awareness.getStates()
+    states.forEach((state) => {
+      const peerId = (state as Record<string, unknown>)[AWARENESS_PEER_ID_FIELD]
+      if (typeof peerId !== 'string' || peerId.length === 0) return
+      const user = (state as Record<string, unknown>).user as { name?: unknown, color?: unknown } | undefined
+      const name = typeof user?.name === 'string' ? user.name : peerId
+      avatars.set(peerId, {
+        name,
+        initials: initialsFor(name, peerId),
+        color: typeof user?.color === 'string' ? user.color : fallbackColor
+      })
+    })
+    const selfAvatar = avatars.get(provider.id ?? '') ?? null
+    return { selfAvatar, avatars }
+  }
 
   // --- DOM scaffold -------------------------------------------------------
   const root = document.createElement('div')
@@ -155,7 +231,7 @@ export function createTopologyWidget ({
   headerEl.addEventListener('pointerup', () => { dragOffset = null })
 
   // --- topology snapshot --------------------------------------------------
-  let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], links: [] }
+  let snapshot: TopologySnapshot = { selfId: null, status: 'idle', connecting: [], links: [], selfAvatar: null, avatars: new Map() }
 
   function extractSnapshot (): TopologySnapshot {
     const links = provider.connections.size > 0
@@ -165,11 +241,14 @@ export function createTopologyWidget ({
           synced
         }))
       : []
+    const { selfAvatar, avatars } = extractAvatars()
     return {
       selfId: provider.id ?? null,
       status: provider.peer.open ? 'peer-open' : 'idle',
       connecting: Array.from(provider.connecting),
-      links
+      links,
+      selfAvatar,
+      avatars
     }
   }
 
@@ -237,15 +316,48 @@ export function createTopologyWidget ({
       label.setAttribute('fill', '#cdd6f4')
       label.setAttribute('font-size', '10')
       label.textContent = link.peerId
+
+      // Avatar overlay: initials on the node when awareness info exists;
+      // otherwise keep the plain colored node.
+      const avatar = snapshot.avatars.get(link.peerId)
+      if (avatar) {
+        node.setAttribute('r', '10')
+        const initials = document.createElementNS(ns, 'text')
+        initials.setAttribute('x', String(px))
+        initials.setAttribute('y', String(py))
+        initials.setAttribute('dy', '0.35em')
+        initials.setAttribute('text-anchor', 'middle')
+        initials.setAttribute('fill', '#1e1e2e')
+        initials.setAttribute('font-size', '8')
+        initials.setAttribute('font-weight', 'bold')
+        initials.textContent = avatar.initials
+        svg.appendChild(initials)
+        label.setAttribute('y', String(py - 14))
+        label.textContent = avatar.name !== link.peerId ? `${avatar.name} (${link.peerId})` : link.peerId
+      }
+
       svg.appendChild(label)
     })
 
     const selfNode = document.createElementNS(ns, 'circle')
     selfNode.setAttribute('cx', String(cx))
     selfNode.setAttribute('cy', String(cy))
-    selfNode.setAttribute('r', '10')
-    selfNode.setAttribute('fill', '#89b4fa')
+    selfNode.setAttribute('r', snapshot.selfAvatar ? '12' : '10')
+    selfNode.setAttribute('fill', snapshot.selfAvatar?.color ?? '#89b4fa')
     svg.appendChild(selfNode)
+
+    if (snapshot.selfAvatar) {
+      const selfInitials = document.createElementNS(ns, 'text')
+      selfInitials.setAttribute('x', String(cx))
+      selfInitials.setAttribute('y', String(cy))
+      selfInitials.setAttribute('dy', '0.35em')
+      selfInitials.setAttribute('text-anchor', 'middle')
+      selfInitials.setAttribute('fill', '#1e1e2e')
+      selfInitials.setAttribute('font-size', '9')
+      selfInitials.setAttribute('font-weight', 'bold')
+      selfInitials.textContent = snapshot.selfAvatar.initials
+      svg.appendChild(selfInitials)
+    }
 
     graphEl.replaceChildren(svg)
 
@@ -288,6 +400,8 @@ export function createTopologyWidget ({
   // --- provider wiring ----------------------------------------------------
   const events = ['peers', 'status', 'synced', 'connection-error'] as const
   events.forEach((name) => provider.on(name, render as () => void))
+  // Awareness changes add/remove/refresh avatars — re-render on each one.
+  provider.awareness.on('update', render as () => void)
   applyCollapsed()
   render()
 
@@ -298,6 +412,7 @@ export function createTopologyWidget ({
     setCollapsed,
     destroy () {
       events.forEach((name) => provider.off(name, render as (...args: unknown[]) => void))
+      provider.awareness.off('update', render as (...args: unknown[]) => void)
       root.remove()
     }
   }

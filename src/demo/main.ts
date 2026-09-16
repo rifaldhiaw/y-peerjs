@@ -34,6 +34,16 @@ const provider = new PeerjsProvider(doc, {
   autoConnectTo: [] // or: ['known-peer-id'] to reconnect automatically on load
 })
 
+// Presence info: the widget reads `user` (name + color) for the avatar
+// overlay on the topology nodes. Change the seed to try different looks.
+const USERS = [
+  { name: 'Alice', color: '#f38ba8' },
+  { name: 'Bob', color: '#89b4fa' },
+  { name: 'Carol', color: '#a6e3a1' }
+]
+const me = USERS[Math.floor(Math.random() * USERS.length)]
+provider.awareness.setLocalStateField('user', me)
+
 // Floating panel: live topology graph (directed edges) + connect/disconnect
 // controls. Press the ▸/▾ button in its header to collapse/expand it.
 const widget = createTopologyWidget({

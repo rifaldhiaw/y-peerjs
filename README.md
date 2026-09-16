@@ -196,7 +196,10 @@ const widget = createTopologyWidget({ provider })
 
 // The panel is draggable and collapsible (▸/▾ in its header). Edges in the
 // graph are directed: the arrow points from whoever called connect() to
-// whoever accepted it. Programmatic control is available too:
+// whoever accepted it. Nodes show initials avatars derived from the
+// standard `user` awareness field — e.g.:
+// provider.awareness.setLocalStateField('user', { name: 'Alice', color: '#f38ba8' })
+// Programmatic control is available too:
 // widget.setCollapsed(true)
 // widget.isCollapsed()
 
